@@ -12,9 +12,13 @@ __all__ = [
 ]
 
 CACHE_T = 2
+"""
+need to write a 3D kernel
+replace F.conv3d? -> can't find pytorch code for this
 
+"""
 
-class CausalConv3d(nn.Conv3d):
+class CausalConv3d(nn.Conv3d): 
     """
     Causal 3d convolusion.
     """
