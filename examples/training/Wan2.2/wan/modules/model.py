@@ -15,6 +15,8 @@ def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
+
+    # TODO: Look into float64 viability? Surely bf16 or f32 is a better alternative?
     position = position.type(torch.float64)
 
     # calculation
@@ -24,8 +26,10 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
+# TODO: Remove CUDA-specific autocasting
 @torch.amp.autocast('cuda', enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
+    # TODO: Look into float64 viability? Surely bf16 or f32 is a better alternative? Precision required for complex numbers for RoPE?
     assert dim % 2 == 0
     freqs = torch.outer(
         torch.arange(max_seq_len),
@@ -35,6 +39,10 @@ def rope_params(max_seq_len, dim, theta=10000):
     return freqs
 
 
+# TODO: Remove CUDA-specific autocasting
+# TODO: First enhance this for torch-neuron to compile this efficiently to XLA
+# TODO: for instance, looping over grid_sizes python list is surely unoptimal
+# TODO: Fused Kernel for Rope3D if we profile and this can be improved upon?
 @torch.amp.autocast('cuda', enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
@@ -48,6 +56,7 @@ def rope_apply(x, grid_sizes, freqs):
         seq_len = f * h * w
 
         # precompute multipliers
+        # TODO: float64 issue again
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
             seq_len, n, -1, 2))
         freqs_i = torch.cat([
@@ -66,6 +75,7 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).float()
 
 
+# TODO: Check if NKI RMSNorm is applicable here, and if so if it's faster (profile!)
 class WanRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-5):
@@ -79,6 +89,7 @@ class WanRMSNorm(nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
+        # TODO: Float casting necessary?
         return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):
@@ -95,9 +106,11 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
+        # TODO: Float casting necessary?
         return super().forward(x.float()).type_as(x)
 
 
+# TODO: Interface with a fused kernel impl (if necessary)
 class WanSelfAttention(nn.Module):
 
     def __init__(self,
@@ -235,6 +248,8 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
+
+        # TODO: Remove cuda autocasting
         with torch.amp.autocast('cuda', dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
         assert e[0].dtype == torch.float32
@@ -243,6 +258,8 @@ class WanAttentionBlock(nn.Module):
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
             seq_lens, grid_sizes, freqs)
+
+        # TODO: Remove cuda autocasting
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -251,6 +268,8 @@ class WanAttentionBlock(nn.Module):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(
                 self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
+
+            # TODO: Remove cuda autocasting
             with torch.amp.autocast('cuda', dtype=torch.float32):
                 x = x + y * e[5].squeeze(2)
             return x

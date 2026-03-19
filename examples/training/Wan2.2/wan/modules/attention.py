@@ -1,6 +1,56 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
 
+
+
+# TODO: Implement functionality for NKI Fused Attention Kernel
+# https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/library/api/attention-cte.html
+# https://awsdocs-neuron.readthedocs-hosted.com/en/v2.28.1/libraries/nxd-training/general/config_overview.html
+# TODO: Look into from neuronx_distributed.kernels.flash_attn import nki_flash_attn_func instead for flash attention impl with a valid backward
+# For instance: https://github.com/aws-neuron/neuronx-distributed/blob/main/examples/training/llama/modeling_llama_nxd.py
+
+'''
+from nkilib.core.attention.attention_cte import attention_cte
+
+class AttentionCTEFunction(torch.autograd.Function):
+
+    # TODO: refer to https://docs.pytorch.org/docs/stable/generated/torch.autograd.Function.forward.html
+    @staticmethod
+    def forward(ctx, q, k, v, causal_mask=True, scale=1.0):
+        # q, k, v expected on xla/neuron device
+        # shapes expected:
+        # q: [B, L_q, D]
+        # k: [B_kv, L_kv, D]
+        # v: [B_kv, L_kv, D]
+        # TODO: D has to be the same for all of Q, K, V??
+        # TODO: Head dimension pushed into B??
+
+        out = attention_cte(
+            q=q,
+            k=k,
+            v=v,
+            scale=scale,
+            causal_mask=causal_mask,
+            ...
+        )
+
+        # TODO: figure the rest of this out
+
+    # TODO: refer to https://docs.pytorch.org/docs/stable/generated/torch.autograd.Function.backward.html
+    @staticmethod
+    def backward(ctx, dout):
+        # TODO: how does this work?
+        pass
+
+def attention_fused_nki(q, k, v, ...):
+    # TODO: Figure out shapes
+
+    # TODO: AttentionCTEFunction.apply(q, k, v, ...)
+    return out
+'''
+
+
+
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
