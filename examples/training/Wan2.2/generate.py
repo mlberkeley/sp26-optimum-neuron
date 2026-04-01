@@ -324,7 +324,8 @@ def generate(args):
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
     if world_size > 1:
-        torch.cuda.set_device(local_rank)
+        # torch.cuda.set_device(local_rank)
+        pass
         dist.init_process_group(
             backend="nccl",
             init_method="env://",
@@ -562,7 +563,7 @@ def generate(args):
                 merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
     del video
 
-    torch.cuda.synchronize()
+    pass # torch.cuda.synchronize()
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()

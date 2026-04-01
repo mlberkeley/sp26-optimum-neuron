@@ -5,3 +5,5 @@ tmp_examples*
 new_checkpoint*
 batch_test*
 nohup*
+.new_venv/
+ckpts

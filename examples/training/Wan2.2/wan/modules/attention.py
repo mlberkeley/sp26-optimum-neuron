@@ -195,7 +195,7 @@ def attention(
     dtype=torch.bfloat16,
     fa_version=None,
 ):
-    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
+    if (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE) and q.device.type == 'cuda':
         return flash_attention(
             q=q,
             k=k,

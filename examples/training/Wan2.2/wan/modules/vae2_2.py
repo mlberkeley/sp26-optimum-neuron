@@ -2,7 +2,7 @@
 import logging
 
 import torch
-import torch.cuda.amp as amp
+import torch.cpu.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -34,7 +34,7 @@ class CausalConv3d(nn.Conv3d):
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
-            cache_x = cache_x.to(x.device)
+            cache_x = cache_x.to(device=x.device, dtype=x.dtype)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
         x = F.pad(x, padding)
@@ -895,7 +895,7 @@ class Wan2_2_VAE:
         dim_mult=[1, 2, 4, 4],
         temperal_downsample=[False, True, True],
         dtype=torch.float,
-        device="cuda",
+        device="cpu",
     ):
 
         self.dtype = dtype
@@ -1019,7 +1019,7 @@ class Wan2_2_VAE:
                 dim=c_dim,
                 dim_mult=dim_mult,
                 temperal_downsample=temperal_downsample,
-            ).eval().requires_grad_(False).to(device))
+            ).eval().requires_grad_(False).to(device).to(self.dtype))
 
     def encode(self, videos):
         try:
@@ -1028,7 +1028,7 @@ class Wan2_2_VAE:
             with amp.autocast(dtype=self.dtype):
                 return [
                     self.model.encode(u.unsqueeze(0),
-                                      self.scale).float().squeeze(0)
+                                      self.scale).to(self.dtype).squeeze(0)
                     for u in videos
                 ]
         except TypeError as e:
