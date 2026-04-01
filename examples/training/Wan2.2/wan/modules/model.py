@@ -26,6 +26,7 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
+'''
 # TODO: Remove CUDA-specific autocasting
 @torch.amp.autocast('cuda', enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
@@ -73,6 +74,79 @@ def rope_apply(x, grid_sizes, freqs):
         # append to collection
         output.append(x_i)
     return torch.stack(output).float()
+'''
+
+
+# TODO: Check device and dtype to ensure they are correct
+def rope_params(max_seq_len, dim, theta=10000.0):
+    assert dim % 2 == 0
+
+    idx = torch.arange(0, dim, 2)  # [dim/2]
+    inv_freq = 1.0 / torch.pow(torch.tensor(theta), idx / dim)
+    positions = torch.arange(max_seq_len)  # [max_seq_len]
+
+    angles = torch.outer(positions, inv_freq)
+    return angles
+
+
+# Real valued implementation of 3D RoPE, avoiding complex numbers.
+def rope_apply(x, grid_sizes, freqs):
+    B, L, N, D = x.shape
+
+    c = D // 2  # number of complex-equivalent channels
+
+    split_sizes = [c - 2 * (c // 3), c // 3, c // 3]
+    freqs_f, freqs_h, freqs_w = freqs.split(split_sizes, dim=1)
+
+    out = []
+
+    # Compute rotations in fp32 for stability, then cast back to x.dtype.
+    x_compute = x.float()
+    freqs_compute = freqs.float()
+
+    freqs_f = freqs_compute[:, :split_sizes[0]]
+    freqs_h = freqs_compute[:, split_sizes[0]:split_sizes[0] + split_sizes[1]]
+    freqs_w = freqs_compute[:, split_sizes[0] + split_sizes[1]:]
+
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+
+        # x_head: [seq_len, N, D] -> [seq_len, N, c, 2]
+        x_head = x_compute[i, :seq_len].reshape(seq_len, N, c, 2)
+
+        # Build per-token phase table exactly like the old code did, but with angles.
+        # Shapes before concat:
+        #   [f, h, w, c_f], [f, h, w, c_h], [f, h, w, c_w]
+        angles = torch.cat(
+            [
+                freqs_f[:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs_h[:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs_w[:w].view(1, 1, w, -1).expand(f, h, w, -1),
+            ],
+            dim=-1,
+        ).reshape(seq_len, 1, c)  # [seq_len, 1, c]
+
+        cos = torch.cos(angles)  # [seq_len, 1, c]
+        sin = torch.sin(angles)  # [seq_len, 1, c]
+
+        x0 = x_head[:, :, :, 0]  # [seq_len, N, c]
+        x1 = x_head[:, :, :, 1]  # [seq_len, N, c]
+
+        # Exact equivalent of complex multiply:
+        # (x0 + i x1) * (cos + i sin)
+        #
+        # real = x0*cos - x1*sin
+        # imag = x0*sin + x1*cos
+        y0 = x0 * cos - x1 * sin
+        y1 = x0 * sin + x1 * cos
+
+        x_rot = torch.stack((y0, y1), dim=-1).flatten(2)  # [seq_len, N, D]
+
+        x_i = torch.cat([x_rot, x_compute[i, seq_len:]], dim=0)  # [L, N, D]
+        out.append(x_i)
+
+    return torch.stack(out, dim=0).to(dtype=x.dtype)
+
 
 
 # TODO: Check if NKI RMSNorm is applicable here, and if so if it's faster (profile!)
