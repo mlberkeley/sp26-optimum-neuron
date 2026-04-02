@@ -44,6 +44,7 @@ class WanTI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        device="cpu"
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -72,7 +73,7 @@ class WanTI2V:
                 Only works without FSDP.
         """
         # self.device = xm.xla_device()
-        self.device = "neuron"
+        self.device = device
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu

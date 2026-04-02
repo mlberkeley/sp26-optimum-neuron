@@ -15,7 +15,7 @@ import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
-from decord import VideoReader
+# from decord import VideoReader
 from PIL import Image
 from safetensors import safe_open
 from torchvision import transforms

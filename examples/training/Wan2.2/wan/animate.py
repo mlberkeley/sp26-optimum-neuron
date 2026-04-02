@@ -12,7 +12,7 @@ import torch
 
 import torch.distributed as dist
 from peft import set_peft_model_state_dict
-from decord import VideoReader
+# from decord import VideoReader
 from tqdm import tqdm
 import torch.nn.functional as F
 from .distributed.fsdp import shard_model
