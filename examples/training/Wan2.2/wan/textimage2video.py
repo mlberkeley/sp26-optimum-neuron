@@ -295,7 +295,7 @@ class WanTI2V:
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device="cpu")
+        seed_g = torch.Generator(device=("cpu" if self.device == "cpu" or self.device == "neuron" else "cuda"))
         seed_g.manual_seed(seed)
 
         if not self.t5_cpu:
@@ -480,7 +480,7 @@ class WanTI2V:
         seq_len = int(math.ceil(seq_len / self.sp_size)) * self.sp_size
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device="cpu")
+        seed_g = torch.Generator(device=("cpu" if self.device == "cpu" or self.device == "neuron" else "cuda"))
         seed_g.manual_seed(seed)
         noise = torch.randn(
             self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
