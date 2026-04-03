@@ -1,4 +1,3 @@
-# ti2v_runner.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -17,6 +16,7 @@ from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CON
 from wan.utils.utils import save_video
 
 import config
+from profiling import region
 
 
 TASK = "ti2v-5B"
@@ -56,8 +56,6 @@ def _build_pipeline():
     resolved = _resolved_cfg()
     cfg = resolved["cfg"]
 
-    # This assumes WanTI2V can accept a device string.
-    # If your local Wan fork instead expects only device_id / rank, adjust this call accordingly.
     return wan.WanTI2V(
         config=cfg,
         checkpoint_dir=str(config.CKPT_DIR),
@@ -78,37 +76,42 @@ def run_once():
     assert config.IMAGE_PATH.exists(), f"Missing image: {config.IMAGE_PATH}"
 
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
     resolved = _resolved_cfg()
-    img = Image.open(config.IMAGE_PATH).convert("RGB")
-    pipe = _build_pipeline()
 
-    video = pipe.generate(
-        config.PROMPT,
-        img=img,
-        size=SIZE_CONFIGS[config.SIZE],
-        max_area=MAX_AREA_CONFIGS[config.SIZE],
-        frame_num=resolved["frame_num"],
-        shift=resolved["sample_shift"],
-        sample_solver=config.SAMPLE_SOLVER,
-        sampling_steps=resolved["sample_steps"],
-        guide_scale=resolved["sample_guide_scale"],
-        seed=config.BASE_SEED,
-        offload_model=config.OFFLOAD_MODEL,
-    )
+    with region("load_image"):
+        img = Image.open(config.IMAGE_PATH).convert("RGB")
+
+    with region("build_pipeline"):
+        pipe = _build_pipeline()
+
+    with region("generate"):
+        video = pipe.generate(
+            config.PROMPT,
+            img=img,
+            size=SIZE_CONFIGS[config.SIZE],
+            max_area=MAX_AREA_CONFIGS[config.SIZE],
+            frame_num=resolved["frame_num"],
+            shift=resolved["sample_shift"],
+            sample_solver=config.SAMPLE_SOLVER,
+            sampling_steps=resolved["sample_steps"],
+            guide_scale=resolved["sample_guide_scale"],
+            seed=config.BASE_SEED,
+            offload_model=config.OFFLOAD_MODEL,
+        )
 
     output_path = None
     if not config.SKIP_SAVE:
-        output_path = _output_path()
-        save_video(
-            tensor=video[None],
-            save_file=str(output_path),
-            fps=WAN_CONFIGS[TASK].sample_fps,
-            nrow=1,
-            normalize=True,
-            value_range=(-1, 1),
-        )
-        print(f"Video saved to: {output_path}")
+        with region("save_video"):
+            output_path = _output_path()
+            save_video(
+                tensor=video[None],
+                save_file=str(output_path),
+                fps=WAN_CONFIGS[TASK].sample_fps,
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1),
+            )
+            print(f"Video saved to: {output_path}")
 
     return {
         "task": TASK,

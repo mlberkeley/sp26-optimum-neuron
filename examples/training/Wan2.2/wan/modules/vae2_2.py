@@ -2,10 +2,10 @@
 import logging
 
 import torch
-import torch.cpu.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from profiling import trace, region
 
 __all__ = [
     "Wan2_2_VAE",
@@ -31,6 +31,7 @@ class CausalConv3d(nn.Conv3d):
         )
         self.padding = (0, 0, 0)
 
+    @trace("causal_conv_3d")
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
@@ -1021,11 +1022,12 @@ class Wan2_2_VAE:
                 temperal_downsample=temperal_downsample,
             ).eval().requires_grad_(False).to(device).to(self.dtype))
 
+    @trace("vae2_2_encode")
     def encode(self, videos):
         try:
             if not isinstance(videos, list):
                 raise TypeError("videos should be a list")
-            with amp.autocast(dtype=self.dtype):
+            with torch.amp.autocast('cpu', dtype=self.dtype):
                 return [
                     self.model.encode(u.unsqueeze(0),
                                       self.scale).to(self.dtype).squeeze(0)
@@ -1035,11 +1037,12 @@ class Wan2_2_VAE:
             logging.info(e)
             return None
 
+    @trace("vae2_2_decode")
     def decode(self, zs):
         try:
             if not isinstance(zs, list):
                 raise TypeError("zs should be a list")
-            with amp.autocast(dtype=self.dtype):
+            with torch.amp.autocast('cpu', dtype=self.dtype):
                 return [
                     self.model.decode(u.unsqueeze(0),
                                       self.scale).float().clamp_(-1,

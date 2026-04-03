@@ -28,7 +28,7 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.utils import best_output_size, masks_like
-
+from profiling import trace, region
 
 class WanTI2V:
 
@@ -238,6 +238,7 @@ class WanTI2V:
             seed=seed,
             offload_model=offload_model)
 
+    @trace("t2v_generate")
     def t2v(self,
             input_prompt,
             size=(1280, 704),
@@ -407,6 +408,7 @@ class WanTI2V:
 
         return videos[0] if self.rank == 0 else None
 
+    @trace("i2v_generate")
     def i2v(self,
             input_prompt,
             img,
@@ -559,41 +561,43 @@ class WanTI2V:
             if offload_model or self.init_on_cpu:
                 self.model.to(self.device)
 
-            for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = [latent.to(self.device)]
-                timestep = [t]
 
-                timestep = torch.stack(timestep).to(self.device)
+            with region("denoising_loop"):
+                for _, t in enumerate(tqdm(timesteps)):
+                    latent_model_input = [latent.to(self.device)]
+                    timestep = [t]
 
-                temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
-                temp_ts = torch.cat([
-                    temp_ts,
-                    temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
-                ])
-                timestep = temp_ts.unsqueeze(0)
+                    timestep = torch.stack(timestep).to(self.device)
 
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                if offload_model:
-                    pass
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
-                if offload_model:
-                    pass
-                noise_pred = noise_pred_uncond + guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                    temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
+                    temp_ts = torch.cat([
+                        temp_ts,
+                        temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
+                    ])
+                    timestep = temp_ts.unsqueeze(0)
 
-                temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
-                    t,
-                    latent.unsqueeze(0),
-                    return_dict=False,
-                    generator=seed_g)[0]
-                latent = temp_x0.squeeze(0)
-                latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+                    noise_pred_cond = self.model(
+                        latent_model_input, t=timestep, **arg_c)[0]
+                    if offload_model:
+                        pass
+                    noise_pred_uncond = self.model(
+                        latent_model_input, t=timestep, **arg_null)[0]
+                    if offload_model:
+                        pass
+                    noise_pred = noise_pred_uncond + guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
 
-                x0 = [latent]
-                del latent_model_input, timestep
+                    temp_x0 = sample_scheduler.step(
+                        noise_pred.unsqueeze(0),
+                        t,
+                        latent.unsqueeze(0),
+                        return_dict=False,
+                        generator=seed_g)[0]
+                    latent = temp_x0.squeeze(0)
+                    latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+
+                    x0 = [latent]
+                    del latent_model_input, timestep
 
             if offload_model:
                 self.model.cpu()

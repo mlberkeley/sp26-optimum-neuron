@@ -2,12 +2,14 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
 import math
+import time
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .tokenizers import HuggingfaceTokenizer
+from profiling import trace, region
 
 __all__ = [
     'T5Model',
@@ -167,6 +169,7 @@ class T5SelfAttention(nn.Module):
         self.pos_embedding = None if shared_pos else T5RelativeEmbedding(
             num_buckets, num_heads, bidirectional=True)
 
+    @trace("t5_self_attn")
     def forward(self, x, mask=None, pos_bias=None):
         e = pos_bias if self.shared_pos else self.pos_embedding(
             x.size(1), x.size(1))
@@ -300,6 +303,7 @@ class T5Encoder(nn.Module):
         # initialize weights
         self.apply(init_weights)
 
+    @trace("t5_forward")
     def forward(self, ids, mask=None):
         x = self.token_embedding(ids)
         x = self.dropout(x)
@@ -503,11 +507,20 @@ class T5EncoderModel:
         self.tokenizer = HuggingfaceTokenizer(
             name=tokenizer_path, seq_len=text_len, clean='whitespace')
 
+    @trace("t5__call__")
     def __call__(self, texts, device):
+        print("Calling T5")
+        # check profiling timing is correct
+        start_time = time.perf_counter()
+
         ids, mask = self.tokenizer(
             texts, return_mask=True, add_special_tokens=True)
         ids = ids.to(device)
         mask = mask.to(device)
         seq_lens = mask.gt(0).sum(dim=1).long()
         context = self.model(ids, mask)
-        return [u[:v] for u, v in zip(context, seq_lens)]
+
+        out = [u[:v] for u, v in zip(context, seq_lens)]
+
+        print(f"T5 Elapsed: {time.perf_counter() - start_time}")
+        return out

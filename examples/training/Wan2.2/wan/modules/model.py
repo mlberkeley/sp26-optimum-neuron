@@ -7,6 +7,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import attention as flash_attention
+from profiling import trace, region
 
 __all__ = ['WanModel']
 
@@ -90,6 +91,7 @@ def rope_params(max_seq_len, dim, theta=10000.0):
 
 
 # Real valued implementation of 3D RoPE, avoiding complex numbers.
+@trace("rope_apply")
 def rope_apply(x, grid_sizes, freqs):
     B, L, N, D = x.shape
 
@@ -209,6 +211,7 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+    @trace("self_attn")
     def forward(self, x, seq_lens, grid_sizes, freqs):
         r"""
         Args:
@@ -243,6 +246,7 @@ class WanSelfAttention(nn.Module):
 
 class WanCrossAttention(WanSelfAttention):
 
+    @trace("cross_attn")
     def forward(self, x, context, context_lens):
         r"""
         Args:
@@ -302,6 +306,7 @@ class WanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
+    @trace("wan_attn_block")
     def forward(
         self,
         x,
@@ -359,6 +364,7 @@ class Head(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
+    @trace("head_forward")
     def forward(self, x, e):
         r"""
         Args:
@@ -488,6 +494,7 @@ class WanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
+    @trace("wan_model_forward")
     def forward(
         self,
         x,
@@ -576,6 +583,7 @@ class WanModel(ModelMixin, ConfigMixin):
         x = self.unpatchify(x, grid_sizes)
         return x
 
+    @trace("unpatchify")
     def unpatchify(self, x, grid_sizes):
         r"""
         Reconstruct video tensors from patch embeddings.

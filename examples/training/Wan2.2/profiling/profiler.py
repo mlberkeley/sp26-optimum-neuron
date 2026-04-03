@@ -59,6 +59,19 @@ class StatBucket:
         }
 
 
+@dataclass
+class CollapsedNode:
+    name: str
+    count: int = 0
+    total_s: float = 0.0
+    exclusive_s: float = 0.0
+    children: dict[str, "CollapsedNode"] = field(default_factory=dict)
+
+    @property
+    def avg_s(self) -> float:
+        return self.total_s / self.count if self.count else 0.0
+
+
 class Profiler:
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
@@ -153,6 +166,7 @@ class Profiler:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
+    # outputs entire tree of calls (very big)
     def format_tree(self, min_time_s: float = 0.0) -> str:
         if self.root is None:
             return ""
@@ -173,4 +187,115 @@ class Profiler:
                 visit(child, depth + 1)
 
         visit(self.root, 0)
-        return "\n".join(lines)
+        out = "\n".join(lines) + "\n"
+        return out
+
+    def _collapse_subtree(self, node: ProfileNode) -> CollapsedNode:
+        collapsed = CollapsedNode(
+            name=node.name,
+            count=1,
+            total_s=node.elapsed_s,
+            exclusive_s=node.exclusive_s,
+        )
+
+        # recursively collapse node's children
+        for child in node.children:
+            child_collapsed = self._collapse_subtree(child)
+
+            # merge nodes with same name
+            existing = collapsed.children.get(child_collapsed.name)
+            if existing is None:
+                collapsed.children[child_collapsed.name] = child_collapsed
+            else:
+                self._merge_collapsed_nodes(existing, child_collapsed)
+
+        return collapsed
+
+    def _merge_collapsed_nodes(self, dst: CollapsedNode, src: CollapsedNode) -> None:
+        dst.count += src.count
+        dst.total_s += src.total_s
+        dst.exclusive_s += src.exclusive_s
+
+        # need to recursively merge collapsed nodes since 
+        # children of two nodes to be merged could have the same name, so they need to be merged
+        for child_name, src_child in src.children.items():
+            dst_child = dst.children.get(child_name)
+            if dst_child is None:
+                dst.children[child_name] = src_child
+            else:
+                self._merge_collapsed_nodes(dst_child, src_child)
+
+    def format_collapsed_tree(self, min_time_s: float = 0.0) -> str:
+        if self.root is None:
+            return ""
+
+        collapsed_root = self._collapse_subtree(self.root)
+        lines: list[str] = []
+
+        def visit(node: CollapsedNode, depth: int) -> None:
+            if depth > 0 and node.total_s < min_time_s:
+                return
+
+            indent = "  " * depth
+            lines.append(
+                f"{indent}{node.name}: "
+                f"count={node.count} "
+                f"total={node.total_s:.6f}s "
+                f"exclusive={node.exclusive_s:.6f}s "
+                f"avg={node.avg_s:.6f}s"
+            )
+
+            for child in sorted(node.children.values(), key=lambda c: c.total_s, reverse=True):
+                visit(child, depth + 1)
+
+        visit(collapsed_root, 0)
+        out = "\n".join(lines) + "\n"
+        return out
+
+    def format_table(
+        self,
+        by: str = "name",
+        sort_by: str = "total_s",  # choose an attribute of StatBucket (total_s, exclusive_s, min_s, max_s)
+        top_k: int = 200,
+    ) -> str:
+        if by == "name":
+            buckets = self.stats_by_name
+        elif by == "path":
+            buckets = self.stats_by_path
+        else:
+            raise ValueError(f"Unsupported table grouping: {by}")
+
+        rows = list(buckets.values())
+        rows.sort(key=lambda bucket: getattr(bucket, sort_by), reverse=True)
+
+        header = (
+            f"{'name':100} "
+            f"{'count':>8} "
+            f"{'total_s':>12} "
+            f"{'excl_s':>12} "
+            f"{'avg_s':>12} "
+            f"{'min_s':>12} "
+            f"{'max_s':>12}"
+        )
+        sep = "-" * len(header)
+        out = [header, sep]
+
+        for bucket in rows[:top_k]:
+            name = bucket.name
+            if by == "path":
+                parts = name.split('.')
+                if len(parts) > 1:
+                    name = "run." + ".".join(parts[1:])
+
+            out.append(
+                f"{name[:100]:100} "
+                f"{bucket.count:8d} "
+                f"{bucket.total_s:12.6f} "
+                f"{bucket.exclusive_s:12.6f} "
+                f"{bucket.avg_s:12.6f} "
+                f"{(0.0 if bucket.count == 0 else bucket.min_s):12.6f} "
+                f"{bucket.max_s:12.6f}"
+            )
+
+        p = "\n".join(out) + "\n"
+        return p
