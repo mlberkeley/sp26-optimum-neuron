@@ -1,0 +1,43 @@
+{
+  "used_cuda_metrics": false,
+  "command": [
+    "/home/eecs/xihc/workspace/sp26-optimum-neuron/examples/training/Wan2.2/.venv/bin/python3",
+    "generate.py",
+    "--task",
+    "ti2v-5B",
+    "--size",
+    "1280*704",
+    "--ckpt_dir",
+    "/home/eecs/xihc/workspace/sp26-optimum-neuron/examples/training/Wan2.2/ckpts/Wan2.2-TI2V-5B",
+    "--offload_model",
+    "True",
+    "--convert_model_dtype",
+    "--t5_cpu",
+    "--image",
+    "/home/eecs/xihc/workspace/sp26-optimum-neuron/examples/training/Wan2.2/examples/i2v_input.JPG",
+    "--prompt",
+    "A cinematic medium shot of a lighthouse on a rocky coast during sunset, waves crashing, realistic motion, filmic detail.",
+    "--base_seed",
+    "1234",
+    "--frame_num",
+    "17",
+    "--sample_steps",
+    "8",
+    "--save_file",
+    "/home/eecs/xihc/workspace/sp26-optimum-neuron/examples/training/Wan2.2/outputs/ti2v_smoke.mp4"
+  ],
+  "output_path": "/home/eecs/xihc/workspace/sp26-optimum-neuron/examples/training/Wan2.2/outputs/ti2v_smoke.mp4",
+  "log_path": "/home/eecs/xihc/workspace/sp26-optimum-neuron/examples/training/Wan2.2/outputs/ti2v_smoke.log",
+  "ncu_raw_csv_path": null,
+  "ncu_summary": null,
+  "derived_metrics": {
+    "estimated_total_flops": 240000000000.0,
+    "estimated_total_tflops": 0.24,
+    "elapsed_s": 312.3963953219354,
+    "achieved_tflops": 0.0007682547032998624,
+    "ai_dram": null,
+    "ai_l2": null,
+    "ai_l1": null,
+    "mfu": null
+  }
+}

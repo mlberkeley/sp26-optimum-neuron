@@ -1,0 +1,42 @@
+{
+  "task": "ti2v-5B",
+  "output_path": "/home/eecs/xihc/workspace/sp26-optimum-neuron/examples/training/Wan2.2/outputs/ti2v_1280*704_8steps_20260401_014843.mp4",
+  "ncu_summary": null,
+  "derived_metrics": {
+    "estimated_total_flops": 240000000000.0,
+    "estimated_total_tflops": 0.24,
+    "wall_generation_elapsed_s": 201.27040723897517,
+    "kernel_elapsed_s": null,
+    "time_per_step_wall_s": 25.158800904871896,
+    "time_per_step_kernel_s": null,
+    "frames_per_s_wall": 0.08446348488685336,
+    "frames_per_s_kernel": null,
+    "pixels_per_s_wall": 76111.7355012413,
+    "pixels_per_s_kernel": null,
+    "achieved_tflops_wall": 0.001192425668990871,
+    "achieved_tflops_kernel": null,
+    "peak_memory_allocated_bytes": 21790073856,
+    "peak_memory_allocated_gb": 20.293587684631348,
+    "peak_memory_reserved_bytes": 24236785664,
+    "peak_memory_reserved_gb": 22.572265625,
+    "ai_dram": null,
+    "ai_l2": null,
+    "ai_l1": null,
+    "mfu_wall": null,
+    "mfu_kernel": null,
+    "duration_weighted_sm_efficiency_pct": null,
+    "duration_weighted_tensor_active_pct": null,
+    "resolved_runtime_config": {
+      "size": "1280*704",
+      "frame_num": 17,
+      "sample_steps": 8,
+      "sample_shift": 5.0,
+      "sample_guide_scale": 5.0,
+      "sample_solver": "unipc",
+      "offload_model": true,
+      "t5_cpu": true,
+      "convert_model_dtype": true,
+      "cuda_available": true
+    }
+  }
+}
