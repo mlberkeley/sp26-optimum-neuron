@@ -34,12 +34,12 @@ SIZE = "1280*704"
 # reason: one latent time step corresponds to 4 output frames and +1 for anchor/initial frame
 
 # bigger numbers
-FRAME_NUM = 81
-SAMPLE_STEPS = 24
+# FRAME_NUM = 81
+# SAMPLE_STEPS = 24
 
 # smaller numbers
-# FRAME_NUM = 17
-# SAMPLE_STEPS = 8
+FRAME_NUM = 17
+SAMPLE_STEPS = 8
 
 SAMPLE_SOLVER = "unipc"
 BASE_SEED = 1234

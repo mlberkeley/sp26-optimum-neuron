@@ -8,6 +8,10 @@ from functools import wraps
 from typing import Any, Callable, Optional
 import json
 import time
+import torch
+
+
+DEVICE = 'cuda'  # set to cuda, neuron or cpu
 
 
 @dataclass
@@ -119,6 +123,11 @@ class Profiler:
 
         if parent is not None:
             parent.children.append(node)
+        
+        if DEVICE == 'cuda':
+            torch.cuda.synchronize()
+        elif DEVICE == 'neuron':
+            torch.neuron.synchronize()
 
         node.start_time = time.perf_counter()
         self.stack.append(node)
@@ -126,6 +135,12 @@ class Profiler:
         try:
             yield node
         finally:
+
+            if DEVICE == 'cuda':
+                torch.cuda.synchronize()
+            elif DEVICE == 'neuron':
+                torch.neuron.synchronize()
+
             node.end_time = time.perf_counter()
             node.elapsed_s = node.end_time - node.start_time
             self.stack.pop()
