@@ -1,0 +1,22 @@
+name                                                                                                    count      total_s       excl_s        avg_s        min_s        max_s
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+run.generate.i2v_generate.vae2_2_decode.causal_conv_3d                                                    169   484.486124   484.486124     2.866782     0.001595    76.823584
+run.generate.i2v_generate.vae2_2_decode                                                                     1   754.885372   270.399248   754.885372   754.885372   754.885372
+run.generate.i2v_generate.denoising_loop.wan_model_forward.wan_attn_block.self_attn.rope_apply            960   125.789528   125.789528     0.131031     0.118362    11.873454
+run.build_pipeline                                                                                          1    76.392669    76.392669    76.392669    76.392669    76.392669
+run.generate.i2v_generate.vae2_2_encode                                                                     1    98.562094    59.850580    98.562094    98.562094    98.562094
+run.generate.i2v_generate.denoising_loop.wan_model_forward.wan_attn_block.self_attn                       480   168.775623    42.986095     0.351616     0.271362    38.321711
+run.generate.i2v_generate.vae2_2_encode.causal_conv_3d                                                     25    38.711514    38.711514     1.548461     0.001194     7.931506
+run.generate.i2v_generate.denoising_loop                                                                    1   253.511080    24.562255   253.511080   253.511080   253.511080
+run.generate.i2v_generate.denoising_loop.wan_model_forward                                                 16   228.948825    23.407643    14.309302     8.860304    93.815473
+run.generate.i2v_generate.denoising_loop.wan_model_forward.wan_attn_block                                 480   201.154686    21.574633     0.419072     0.293000    60.197659
+run.save_video                                                                                              1    16.125829    16.125829    16.125829    16.125829    16.125829
+run.generate.i2v_generate.denoising_loop.wan_model_forward.wan_attn_block.cross_attn                      480    10.804431    10.804431     0.022509     0.005906     7.776760
+run.generate.i2v_generate                                                                                   1  1121.034521     8.903652  1121.034521  1121.034521  1121.034521
+run.generate.i2v_generate.t5__call__.t5_forward.t5_self_attn                                               48     5.163392     5.163392     0.107571     0.103702     0.143877
+run.generate.i2v_generate.denoising_loop.wan_model_forward.head_forward                                    16     2.626776     2.626776     0.164173     0.002040     2.594810
+run.generate.i2v_generate.denoising_loop.wan_model_forward.unpatchify                                      16     1.759720     1.759720     0.109983     0.000856     1.744852
+run.load_image                                                                                              1     0.011696     0.011696     0.011696     0.011696     0.011696
+run.generate.i2v_generate.t5__call__.t5_forward                                                             2     5.169169     0.005777     2.584584     2.559775     2.609394
+run.generate.i2v_generate.t5__call__                                                                        2     5.172322     0.003154     2.586161     2.561093     2.611229
+run.generate                                                                                                1  1121.034591     0.000070  1121.034591  1121.034591  1121.034591

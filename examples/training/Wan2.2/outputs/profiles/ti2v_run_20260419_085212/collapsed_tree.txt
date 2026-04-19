@@ -1,0 +1,21 @@
+ti2v_run_20260419_085212: count=1 total=1214.219455s exclusive=0.654670s avg=1214.219455s
+  generate: count=1 total=1121.034591s exclusive=0.000070s avg=1121.034591s
+    i2v_generate: count=1 total=1121.034521s exclusive=8.903652s avg=1121.034521s
+      vae2_2_decode: count=1 total=754.885372s exclusive=270.399248s avg=754.885372s
+        causal_conv_3d: count=169 total=484.486124s exclusive=484.486124s avg=2.866782s
+      denoising_loop: count=1 total=253.511080s exclusive=24.562255s avg=253.511080s
+        wan_model_forward: count=16 total=228.948825s exclusive=23.407643s avg=14.309302s
+          wan_attn_block: count=480 total=201.154686s exclusive=21.574633s avg=0.419072s
+            self_attn: count=480 total=168.775623s exclusive=42.986095s avg=0.351616s
+              rope_apply: count=960 total=125.789528s exclusive=125.789528s avg=0.131031s
+            cross_attn: count=480 total=10.804431s exclusive=10.804431s avg=0.022509s
+          head_forward: count=16 total=2.626776s exclusive=2.626776s avg=0.164173s
+          unpatchify: count=16 total=1.759720s exclusive=1.759720s avg=0.109983s
+      vae2_2_encode: count=1 total=98.562094s exclusive=59.850580s avg=98.562094s
+        causal_conv_3d: count=25 total=38.711514s exclusive=38.711514s avg=1.548461s
+      t5__call__: count=2 total=5.172322s exclusive=0.003154s avg=2.586161s
+        t5_forward: count=2 total=5.169169s exclusive=0.005777s avg=2.584584s
+          t5_self_attn: count=48 total=5.163392s exclusive=5.163392s avg=0.107571s
+  build_pipeline: count=1 total=76.392669s exclusive=76.392669s avg=76.392669s
+  save_video: count=1 total=16.125829s exclusive=16.125829s avg=16.125829s
+  load_image: count=1 total=0.011696s exclusive=0.011696s avg=0.011696s
