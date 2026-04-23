@@ -26,6 +26,7 @@ def fp16_clamp(x):
     return x
 
 
+@trace("init_weights")
 def init_weights(m):
     if isinstance(m, T5LayerNorm):
         nn.init.ones_(m.weight)
@@ -53,7 +54,7 @@ class GELU(nn.Module):
 
 
 class T5LayerNorm(nn.Module):
-
+    @trace("t5_layer_norm__init__")
     def __init__(self, dim, eps=1e-6):
         super(T5LayerNorm, self).__init__()
         self.dim = dim
@@ -69,7 +70,7 @@ class T5LayerNorm(nn.Module):
 
 
 class T5Attention(nn.Module):
-
+    @trace("t5_attn__init__")
     def __init__(self, dim, dim_attn, num_heads, dropout=0.1):
         assert dim_attn % num_heads == 0
         super(T5Attention, self).__init__()
@@ -123,17 +124,22 @@ class T5Attention(nn.Module):
 
 
 class T5FeedForward(nn.Module):
-
+    @trace("t5_ffn__init__")
     def __init__(self, dim, dim_ffn, dropout=0.1):
         super(T5FeedForward, self).__init__()
         self.dim = dim
         self.dim_ffn = dim_ffn
 
         # layers
-        self.gate = nn.Sequential(nn.Linear(dim, dim_ffn, bias=False), GELU())
-        self.fc1 = nn.Linear(dim, dim_ffn, bias=False)
-        self.fc2 = nn.Linear(dim_ffn, dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        with region("t5_ffn_gate_init"):
+            self.gate = nn.Sequential(nn.Linear(dim, dim_ffn, bias=False), GELU())
+
+        with region("t5_ffn_fc_init"):
+            self.fc1 = nn.Linear(dim, dim_ffn, bias=False)
+            self.fc2 = nn.Linear(dim_ffn, dim, bias=False)
+
+        with region("t5_ffn_dropout"):
+            self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         x = self.fc1(x) * self.gate(x)
@@ -144,7 +150,7 @@ class T5FeedForward(nn.Module):
 
 
 class T5SelfAttention(nn.Module):
-
+    @trace("t5_self_attn__init__")
     def __init__(self,
                  dim,
                  dim_attn,
@@ -223,6 +229,7 @@ class T5CrossAttention(nn.Module):
 
 class T5RelativeEmbedding(nn.Module):
 
+    @trace("t5rel_embed__init__")
     def __init__(self, num_buckets, num_heads, bidirectional, max_dist=128):
         super(T5RelativeEmbedding, self).__init__()
         self.num_buckets = num_buckets
@@ -268,7 +275,7 @@ class T5RelativeEmbedding(nn.Module):
 
 
 class T5Encoder(nn.Module):
-
+    @trace("t5encoder__init__")
     def __init__(self,
                  vocab,
                  dim,
@@ -416,6 +423,7 @@ class T5Model(nn.Module):
         return x
 
 
+@trace("_t5")
 def _t5(name,
         encoder_only=False,
         decoder_only=False,
@@ -457,6 +465,7 @@ def _t5(name,
         return model
 
 
+@trace("umt5_xxl")
 def umt5_xxl(**kwargs):
     cfg = dict(
         vocab_size=256384,
@@ -475,6 +484,7 @@ def umt5_xxl(**kwargs):
 
 class T5EncoderModel:
 
+    @trace("t5__init__")
     def __init__(
         self,
         text_len,
@@ -504,8 +514,9 @@ class T5EncoderModel:
         else:
             self.model.to(self.device)
         # init tokenizer
-        self.tokenizer = HuggingfaceTokenizer(
-            name=tokenizer_path, seq_len=text_len, clean='whitespace')
+        with region("t5_load_tokenizer"):
+            self.tokenizer = HuggingfaceTokenizer(
+                name=tokenizer_path, seq_len=text_len, clean='whitespace')
 
     @trace("t5__call__")
     def __call__(self, texts, device):

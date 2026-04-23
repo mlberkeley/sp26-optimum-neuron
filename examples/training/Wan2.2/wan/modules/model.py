@@ -79,6 +79,8 @@ def rope_apply(x, grid_sizes, freqs):
 
 
 # TODO: Check device and dtype to ensure they are correct
+
+@trace("rope_params")
 def rope_params(max_seq_len, dim, theta=10000.0):
     assert dim % 2 == 0
 
@@ -92,60 +94,105 @@ def rope_params(max_seq_len, dim, theta=10000.0):
 
 # Real valued implementation of 3D RoPE, avoiding complex numbers.
 @trace("rope_apply")
-def rope_apply(x, grid_sizes, freqs):
-    B, L, N, D = x.shape
+def rope_apply(x, grid_sizes, freqs, even_mask, odd_mask):
+    with region("rope_begin"):
+        B, L, N, D = x.shape
+        # batch, sequence length, number of heads, embedding dimension
 
-    c = D // 2  # number of complex-equivalent channels
+        c = D // 2  # number of complex-equivalent channels
 
-    split_sizes = [c - 2 * (c // 3), c // 3, c // 3]
-    freqs_f, freqs_h, freqs_w = freqs.split(split_sizes, dim=1)
+        split_sizes = [c - 2 * (c // 3), c // 3, c // 3]
+        freqs_f, freqs_h, freqs_w = freqs.split(split_sizes, dim=1)
 
-    out = []
+        out = []
 
-    # Compute rotations in fp32 for stability, then cast back to x.dtype.
-    x_compute = x.float()
-    freqs_compute = freqs.float()
+        # Compute rotations in fp32 for stability, then cast back to x.dtype.
+        x_compute = x.float()
+        freqs_compute = freqs.float()
 
-    freqs_f = freqs_compute[:, :split_sizes[0]]
-    freqs_h = freqs_compute[:, split_sizes[0]:split_sizes[0] + split_sizes[1]]
-    freqs_w = freqs_compute[:, split_sizes[0] + split_sizes[1]:]
+        freqs_f = freqs_compute[:, :split_sizes[0]]
+        freqs_h = freqs_compute[:, split_sizes[0]:split_sizes[0] + split_sizes[1]]
+        freqs_w = freqs_compute[:, split_sizes[0] + split_sizes[1]:]
 
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
+    with region("rope_loop"):
+        for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+            seq_len = f * h * w
 
-        # x_head: [seq_len, N, D] -> [seq_len, N, c, 2]
-        x_head = x_compute[i, :seq_len].reshape(seq_len, N, c, 2)
+            # x_head: [seq_len, N, D] -> [seq_len, N, c, 2]
+            x_head = x_compute[i, :seq_len].reshape(seq_len, N, c, 2)
 
-        # Build per-token phase table exactly like the old code did, but with angles.
-        # Shapes before concat:
-        #   [f, h, w, c_f], [f, h, w, c_h], [f, h, w, c_w]
-        angles = torch.cat(
-            [
-                freqs_f[:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-                freqs_h[:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                freqs_w[:w].view(1, 1, w, -1).expand(f, h, w, -1),
-            ],
-            dim=-1,
-        ).reshape(seq_len, 1, c)  # [seq_len, 1, c]
+            # Build per-token phase table exactly like the old code did, but with angles.
+            # Shapes before concat:
+            #   [f, h, w, c_f], [f, h, w, c_h], [f, h, w, c_w]
+            angles = torch.cat(
+                [
+                    freqs_f[:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                    freqs_h[:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                    freqs_w[:w].view(1, 1, w, -1).expand(f, h, w, -1),
+                ],
+                dim=-1,
+            ).reshape(seq_len, 1, c)  # [seq_len, 1, c]
 
-        cos = torch.cos(angles)  # [seq_len, 1, c]
-        sin = torch.sin(angles)  # [seq_len, 1, c]
+            cos = torch.cos(angles)  # [seq_len, 1, c]
+            sin = torch.sin(angles)  # [seq_len, 1, c]
 
-        x0 = x_head[:, :, :, 0]  # [seq_len, N, c]
-        x1 = x_head[:, :, :, 1]  # [seq_len, N, c]
+            x0 = x_head[:, :, :, 0]  # [seq_len, N, c]
+            x1 = x_head[:, :, :, 1]  # [seq_len, N, c]
 
-        # Exact equivalent of complex multiply:
-        # (x0 + i x1) * (cos + i sin)
-        #
-        # real = x0*cos - x1*sin
-        # imag = x0*sin + x1*cos
-        y0 = x0 * cos - x1 * sin
-        y1 = x0 * sin + x1 * cos
+            # Exact equivalent of complex multiply:
+            # (x0 + i x1) * (cos + i sin)
+            #
+            # real = x0*cos - x1*sin
+            # imag = x0*sin + x1*cos
+            with region("rope_end"):
+                y0 = x0 * cos - x1 * sin  # y0 still [seq_len, N, c]
+                y1 = x0 * sin + x1 * cos  # y1 still [seq_len, N, c]
 
-        x_rot = torch.stack((y0, y1), dim=-1).flatten(2)  # [seq_len, N, D]
+                # stacking results since D = 2 * c
+                # ensure that channels are interleaved for correct rope impl.
 
-        x_i = torch.cat([x_rot, x_compute[i, seq_len:]], dim=0)  # [L, N, D]
-        out.append(x_i)
+                # this is slow cus we are materializing a [seq_len, N, c, 2] from two sequences [seq_len, N, c], and this
+                # is making native torch compile a new tensor, since seq_len is f * h * w which is changing.
+
+                with region("rope_interleave"):
+                    y0e = y0.repeat_interleave(2, dim=-1)   # [seq_len, N, D]
+                    y1e = y1.repeat_interleave(2, dim=-1)   # [seq_len, N, D]
+
+                with region("rope_masked_write"):
+                    x_rot = y0e * even_mask + y1e * odd_mask
+
+                with region("rope_flatten_cat_append"):
+                    x_i = torch.cat([x_rot, x_compute[i, seq_len:]], dim=0)
+                    out.append(x_i)
+                
+                '''
+                with region("rope_end_stack"):
+                    x_rot = torch.stack((y0, y1), dim=-1)  # [seq_len, N, D]
+                
+                with region("rope_end_flatten"):
+                    x_rot = x_rot.flatten(2)
+
+                with region("rope_end_cat"):
+                    x_i = torch.cat([x_rot, x_compute[i, seq_len:]], dim=0)  # [L, N, D]
+
+                out.append(x_i)
+                '''
+                
+                '''
+                with region("rope_clone"):
+                    x_i = x_compute[i].clone()
+
+                with region("rope_view"):
+                    x_i_head = x_i[:seq_len].view(seq_len, N, c, 2)
+
+                with region("rope_write0"):
+                    x_i_head[..., 0] = y0
+
+                with region("rope_write1"):
+                    x_i_head[..., 1] = y1
+
+                out.append(x_i)
+                '''
 
     return torch.stack(out, dim=0).to(dtype=x.dtype)
 
@@ -211,6 +258,13 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+        even_mask = torch.zeros(1, 1, self.head_dim, dtype=torch.float32)
+        even_mask[..., 0::2] = 1
+        odd_mask = 1 - even_mask
+
+        self.register_buffer("even_mask", even_mask)
+        self.register_buffer("odd_mask", odd_mask)
+
     @trace("self_attn")
     def forward(self, x, seq_lens, grid_sizes, freqs):
         r"""
@@ -232,8 +286,8 @@ class WanSelfAttention(nn.Module):
         q, k, v = qkv_fn(x)
 
         x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
+            q=rope_apply(q, grid_sizes, freqs, self.even_mask, self.odd_mask),
+            k=rope_apply(k, grid_sizes, freqs, self.even_mask, self.odd_mask),
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)

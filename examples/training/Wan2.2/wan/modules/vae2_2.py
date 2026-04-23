@@ -888,6 +888,7 @@ def _video_vae(pretrained_path=None, z_dim=16, dim=160, device="cpu", **kwargs):
 
 class Wan2_2_VAE:
 
+    @trace("wan_vae__init__")
     def __init__(
         self,
         z_dim=48,

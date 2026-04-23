@@ -8,7 +8,7 @@ IMAGE_PATH = WAN_ROOT / "examples" / "i2v_input.JPG"
 OUTPUT_DIR = WAN_ROOT / "outputs"
 
 # ---------- device/runtime ----------
-DEVICE = "cuda"  # SET DEVICE!!!!
+DEVICE = "neuron"  # SET DEVICE!!!!
 DEVICE_ID = 0
 RANK = 0
 

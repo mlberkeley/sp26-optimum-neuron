@@ -102,7 +102,9 @@ class WanTI2V:
             device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        with region("load_from_pretrained"):
+            self.model = WanModel.from_pretrained(checkpoint_dir)
+
         self.model = self._configure_model(
             model=self.model,
             use_sp=use_sp,
@@ -117,6 +119,7 @@ class WanTI2V:
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
+    @trace("configure_model")
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
         """

@@ -137,3 +137,7 @@ neuronxcc*/
 
 # Ignore claude settings
 .claude/
+
+
+examples/training/Wan2.2/outputs
+examples/training/Wan2.2/ckpts

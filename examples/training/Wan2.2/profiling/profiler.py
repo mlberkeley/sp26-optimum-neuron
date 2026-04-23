@@ -11,7 +11,7 @@ import time
 import torch
 
 
-DEVICE = 'cuda'  # set to cuda, neuron or cpu
+DEVICE = 'neuron'  # set to cuda, neuron or cpu
 
 
 @dataclass
