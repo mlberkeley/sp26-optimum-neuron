@@ -617,3 +617,226 @@ class WanTI2V:
             dist.barrier()
 
         return videos[0] if self.rank == 0 else None
+
+    @trace("generate_rolling")
+    def generate_rolling(
+        self,
+        input_prompt,
+        img,
+        n_chunks=2,
+        chunk_frame_num=121,
+        max_area=704 * 1280,
+        shift=5.0,
+        sample_solver='unipc',
+        sampling_steps=40,
+        guide_scale=5.0,
+        n_prompt="",
+        seed=-1,
+        offload_model=True,
+    ):
+        r"""
+        Generates a long video by chaining TI2V chunks sequentially.
+
+        The first chunk uses `img` as the image anchor (standard i2v). Each
+        subsequent chunk uses the last latent frame of the previous chunk as its
+        anchor frame, conditioning the new chunk on how the video ended. The
+        anchor latent is reused directly without a VAE decode/re-encode round-trip.
+
+        Total unique output frames = n_chunks * (chunk_frame_num - 1) + 1.
+
+        Args:
+            input_prompt (`str`):
+                Text prompt shared across all chunks.
+            img (PIL.Image.Image):
+                Initial anchor image for the first chunk.
+            n_chunks (`int`, *optional*, defaults to 2):
+                Number of chunks to generate sequentially.
+            chunk_frame_num (`int`, *optional*, defaults to 121):
+                Frames per chunk. Must satisfy 4n+1 (e.g. 81, 121).
+            max_area (`int`, *optional*, defaults to 704*1280):
+                Maximum pixel area for resolution scaling.
+            shift (`float`, *optional*, defaults to 5.0):
+                Noise schedule shift parameter.
+            sample_solver (`str`, *optional*, defaults to 'unipc'):
+                Diffusion solver ('unipc' or 'dpm++').
+            sampling_steps (`int`, *optional*, defaults to 40):
+                Denoising steps per chunk.
+            guide_scale (`float`, *optional*, defaults to 5.0):
+                Classifier-free guidance scale.
+            n_prompt (`str`, *optional*, defaults to ""):
+                Negative prompt.
+            seed (`int`, *optional*, defaults to -1):
+                Base random seed. Chunk k uses seed+k for noise diversity.
+            offload_model (`bool`, *optional*, defaults to True):
+                Offload DiT to CPU between chunks to save VRAM.
+
+        Returns:
+            torch.Tensor or None:
+                (C, N_total, H, W) pixel tensor in [-1, 1] on rank 0, else None.
+                N_total = n_chunks * (chunk_frame_num - 1) + 1.
+        """
+        # ---- image preprocessing (done once to establish output geometry) ----
+        ih, iw = img.height, img.width
+        dh = self.patch_size[1] * self.vae_stride[1]
+        dw = self.patch_size[2] * self.vae_stride[2]
+        ow, oh = best_output_size(iw, ih, dw, dh, max_area)
+
+        scale = max(ow / iw, oh / ih)
+        img_resized = img.resize(
+            (round(iw * scale), round(ih * scale)), Image.LANCZOS)
+        x1 = (img_resized.width - ow) // 2
+        y1 = (img_resized.height - oh) // 2
+        img_resized = img_resized.crop((x1, y1, x1 + ow, y1 + oh))
+        assert img_resized.width == ow and img_resized.height == oh
+
+        img_tensor = (
+            TF.to_tensor(img_resized).sub_(0.5).div_(0.5)
+            .to(self.param_dtype).to(self.device).unsqueeze(1))  # [3, 1, oh, ow]
+
+        F = chunk_frame_num
+        seq_len = ((F - 1) // self.vae_stride[0] + 1) * (
+            oh // self.vae_stride[1]) * (ow // self.vae_stride[2]) // (
+                self.patch_size[1] * self.patch_size[2])
+        seq_len = int(math.ceil(seq_len / self.sp_size)) * self.sp_size
+
+        if n_prompt == "":
+            n_prompt = self.sample_neg_prompt
+        seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
+
+        # ---- text encoding (once, reused across all chunks) -----------------
+        if not self.t5_cpu:
+            self.text_encoder.model.to(self.device)
+            context = self.text_encoder([input_prompt], self.device)
+            context_null = self.text_encoder([n_prompt], self.device)
+            if offload_model:
+                self.text_encoder.model.cpu()
+        else:
+            context = self.text_encoder([input_prompt], torch.device('cpu'))
+            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+            context = [t.to(self.device) for t in context]
+            context_null = [t.to(self.device) for t in context_null]
+
+        arg_c = {'context': [context[0]], 'seq_len': seq_len}
+        arg_null = {'context': context_null, 'seq_len': seq_len}
+
+        # ---- encode the initial anchor image --------------------------------
+        anchor_z = self.vae.encode([img_tensor])[0]  # [C, 1, H_lat, W_lat]
+
+        @contextmanager
+        def noop_no_sync():
+            yield
+
+        no_sync = getattr(self.model, 'no_sync', noop_no_sync)
+
+        all_pixel_frames = []  # accumulated on CPU per chunk
+
+        with (
+            torch.no_grad(),
+            no_sync(),
+        ):
+            if offload_model or self.init_on_cpu:
+                self.model.to(self.device)
+
+            for chunk_idx in range(n_chunks):
+                seed_g = torch.Generator(
+                    device=("cpu" if self.device == "cpu" or self.device == "neuron" else "cuda"))
+                seed_g.manual_seed(seed + chunk_idx)
+
+                noise = torch.randn(
+                    self.vae.model.z_dim,
+                    (F - 1) // self.vae_stride[0] + 1,
+                    oh // self.vae_stride[1],
+                    ow // self.vae_stride[2],
+                    dtype=self.param_dtype,
+                    generator=seed_g,
+                    device=self.device,
+                )
+
+                # build scheduler fresh per chunk so internal state is clean
+                if sample_solver == 'unipc':
+                    sample_scheduler = FlowUniPCMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=1,
+                        use_dynamic_shifting=False)
+                    sample_scheduler.set_timesteps(
+                        sampling_steps, device=self.device, shift=shift)
+                    timesteps = sample_scheduler.timesteps
+                elif sample_solver == 'dpm++':
+                    sample_scheduler = FlowDPMSolverMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=1,
+                        use_dynamic_shifting=False)
+                    sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                    timesteps, _ = retrieve_timesteps(
+                        sample_scheduler,
+                        device=self.device,
+                        sigmas=sampling_sigmas)
+                else:
+                    raise NotImplementedError("Unsupported solver.")
+
+                # anchor_z pins temporal position 0; all other positions are
+                # free noise — identical masking logic to i2v
+                _, mask2 = masks_like([noise], zero=True)
+                latent = (1. - mask2[0]) * anchor_z + mask2[0] * noise
+
+                with region("denoising_loop"):
+                    for _, t in enumerate(
+                            tqdm(timesteps,
+                                 desc=f"Chunk {chunk_idx + 1}/{n_chunks}")):
+                        latent_model_input = [latent.to(self.device)]
+                        timestep = torch.stack([t]).to(self.device)
+
+                        temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
+                        temp_ts = torch.cat([
+                            temp_ts,
+                            temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
+                        ])
+                        timestep = temp_ts.unsqueeze(0)
+
+                        noise_pred_cond = self.model(
+                            latent_model_input, t=timestep, **arg_c)[0]
+                        noise_pred_uncond = self.model(
+                            latent_model_input, t=timestep, **arg_null)[0]
+
+                        noise_pred = noise_pred_uncond + guide_scale * (
+                            noise_pred_cond - noise_pred_uncond)
+
+                        temp_x0 = sample_scheduler.step(
+                            noise_pred.unsqueeze(0),
+                            t,
+                            latent.unsqueeze(0),
+                            return_dict=False,
+                            generator=seed_g)[0]
+                        latent = temp_x0.squeeze(0)
+                        latent = (1. - mask2[0]) * anchor_z + mask2[0] * latent
+
+                # decode this chunk immediately to free latent memory
+                if self.rank == 0:
+                    chunk_video = self.vae.decode([latent])  # [C, F_px, H, W]
+                    frames = chunk_video[0]
+                    if chunk_idx > 0:
+                        # drop the duplicate boundary frame (== last frame of
+                        # the previous chunk, pinned as the anchor)
+                        frames = frames[:, 1:, :, :]
+                    all_pixel_frames.append(frames.cpu())
+
+                # the last latent frame becomes the anchor for the next chunk;
+                # shape [C, 1, H_lat, W_lat] matches z[0] from vae.encode
+                if chunk_idx < n_chunks - 1:
+                    anchor_z = latent[:, -1:, :, :].clone()
+
+                del noise, latent, sample_scheduler
+
+            if offload_model:
+                self.model.cpu()
+
+        result = (torch.cat(all_pixel_frames, dim=1)
+                  if self.rank == 0 else None)
+
+        del all_pixel_frames
+        if offload_model:
+            gc.collect()
+        if dist.is_initialized():
+            dist.barrier()
+
+        return result
