@@ -96,10 +96,12 @@ class WanTI2V:
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+        # VAE uses ops (e.g. constant_pad_nd) unsupported on Neuron; keep it on CPU
+        self.vae_device = self.device if str(self.device).startswith('cuda') else torch.device('cpu')
         self.vae = Wan2_2_VAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             dtype=self.param_dtype,
-            device=self.device)
+            device=self.vae_device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         with region("load_from_pretrained"):
@@ -400,7 +402,7 @@ class WanTI2V:
             if offload_model:
                 self.model.cpu()
             if self.rank == 0:
-                videos = self.vae.decode(x0)
+                videos = self.vae.decode([x.to(self.vae_device) for x in x0])
 
         del noise, latents
         del sample_scheduler
@@ -476,7 +478,7 @@ class WanTI2V:
         assert img.width == ow and img.height == oh
 
         # to tensor
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.param_dtype).to(self.device).unsqueeze(1)
+        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.param_dtype).to(self.vae_device).unsqueeze(1)
 
         F = frame_num
         seq_len = ((F - 1) // self.vae_stride[0] + 1) * (
@@ -511,7 +513,7 @@ class WanTI2V:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
-        z = self.vae.encode([img])
+        z = [zi.to(self.device) for zi in self.vae.encode([img])]
 
         @contextmanager
         def noop_no_sync():
@@ -607,7 +609,7 @@ class WanTI2V:
 
 
             if self.rank == 0:
-                videos = self.vae.decode(x0)
+                videos = self.vae.decode([x.to(self.vae_device) for x in x0])
 
         del noise, latent, x0
         del sample_scheduler
@@ -691,7 +693,7 @@ class WanTI2V:
 
         img_tensor = (
             TF.to_tensor(img_resized).sub_(0.5).div_(0.5)
-            .to(self.param_dtype).to(self.device).unsqueeze(1))  # [3, 1, oh, ow]
+            .to(self.param_dtype).to(self.vae_device).unsqueeze(1))  # [3, 1, oh, ow]
 
         F = chunk_frame_num
         seq_len = ((F - 1) // self.vae_stride[0] + 1) * (
@@ -720,7 +722,7 @@ class WanTI2V:
         arg_null = {'context': context_null, 'seq_len': seq_len}
 
         # ---- encode the initial anchor image --------------------------------
-        anchor_z = self.vae.encode([img_tensor])[0]  # [C, 1, H_lat, W_lat]
+        anchor_z = self.vae.encode([img_tensor])[0].to(self.device)  # [C, 1, H_lat, W_lat]
 
         @contextmanager
         def noop_no_sync():
@@ -812,7 +814,7 @@ class WanTI2V:
 
                 # decode this chunk immediately to free latent memory
                 if self.rank == 0:
-                    chunk_video = self.vae.decode([latent])  # [C, F_px, H, W]
+                    chunk_video = self.vae.decode([latent.to(self.vae_device)])  # [C, F_px, H, W]
                     frames = chunk_video[0]
                     if chunk_idx > 0:
                         # drop the duplicate boundary frame (== last frame of
