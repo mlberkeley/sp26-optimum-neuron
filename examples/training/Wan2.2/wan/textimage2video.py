@@ -635,6 +635,7 @@ class WanTI2V:
         n_prompt="",
         seed=-1,
         offload_model=True,
+        verbose=False,
     ):
         r"""
         Generates a long video by chaining TI2V chunks sequentially.
@@ -731,6 +732,8 @@ class WanTI2V:
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
 
         all_pixel_frames = []  # accumulated on CPU per chunk
+        chunk_timings = []  # [(chunk_idx, t_chunk_s, t_per_step_s, anchor_norm, last_norm), ...]
+        import time as _time
 
         with (
             torch.no_grad(),
@@ -781,6 +784,12 @@ class WanTI2V:
                 _, mask2 = masks_like([noise], zero=True)
                 latent = (1. - mask2[0]) * anchor_z + mask2[0] * noise
 
+                _chunk_t0 = _time.perf_counter() if (verbose and self.rank == 0) else None
+                _anchor_norm = (
+                    float(anchor_z.detach().to(torch.float32).abs().mean().cpu().item())
+                    if (verbose and self.rank == 0) else None
+                )
+
                 with region("denoising_loop"):
                     for _, t in enumerate(
                             tqdm(timesteps,
@@ -811,6 +820,19 @@ class WanTI2V:
                             generator=seed_g)[0]
                         latent = temp_x0.squeeze(0)
                         latent = (1. - mask2[0]) * anchor_z + mask2[0] * latent
+
+                if verbose and self.rank == 0:
+                    _chunk_dt = _time.perf_counter() - _chunk_t0
+                    _last_norm = float(
+                        latent.detach().to(torch.float32).abs().mean().cpu().item())
+                    _per_step = _chunk_dt / max(len(timesteps), 1)
+                    chunk_timings.append((chunk_idx, _chunk_dt, _per_step,
+                                          _anchor_norm, _last_norm))
+                    logging.info(
+                        f"[verbose] chunk {chunk_idx + 1}/{n_chunks}: "
+                        f"{_chunk_dt:.2f}s total, {_per_step:.3f}s/step, "
+                        f"anchor|x|={_anchor_norm:.4f}, last|x|={_last_norm:.4f}"
+                    )
 
                 # decode this chunk immediately to free latent memory
                 if self.rank == 0:

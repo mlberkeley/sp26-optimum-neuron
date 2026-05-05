@@ -1,6 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
-import torch.cuda.amp as amp
 
 from ..modules.model import sinusoidal_embedding_1d
 from .ulysses import distributed_attention
@@ -20,45 +19,78 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
 
 
-@torch.amp.autocast('cuda', enabled=False)
-def rope_apply(x, grid_sizes, freqs):
+@torch.amp.autocast('cpu', enabled=False)
+def rope_apply(x, grid_sizes, freqs, even_mask, odd_mask):
     """
-    x:          [B, L, N, C].
+    Real-valued 3D RoPE for the sequence-parallel path. Mirrors the optimized
+    rope in `wan/modules/model.py` but operates on this rank's per-rank shard:
+    the full f*h*w angle table is built once, padded to s*sp_size with zero
+    angles (cos=1, sin=0 → identity rotation on padding), and only this rank's
+    [sp_rank*s : (sp_rank+1)*s] slice is materialized as cos/sin.
+
+    Avoids `torch.view_as_complex` / `torch.view_as_real` so it lowers cleanly
+    on the PyTorch Native Neuron device.
+
+    x:          [B, s_per_rank, N, D].   s_per_rank = seq_len // sp_size
     grid_sizes: [B, 3].
-    freqs:      [M, C // 2].
+    freqs:      [M, D // 2]   (angle table from rope_params).
+    even_mask:  [1, 1, D] with 1s at even channels, 0s at odd channels.
+    odd_mask:   1 - even_mask.
     """
-    s, n, c = x.size(1), x.size(2), x.size(3) // 2
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    B, s, N, D = x.shape
+    c = D // 2
 
-    # loop over samples
-    output = []
+    sp_size = get_world_size()
+    sp_rank = get_rank()
+    full_s = s * sp_size
+
+    split_sizes = [c - 2 * (c // 3), c // 3, c // 3]
+
+    x_compute = x.float()
+    freqs_compute = freqs.float()
+    freqs_f = freqs_compute[:, :split_sizes[0]]
+    freqs_h = freqs_compute[:, split_sizes[0]:split_sizes[0] + split_sizes[1]]
+    freqs_w = freqs_compute[:, split_sizes[0] + split_sizes[1]:]
+
+    out = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
+        token_len = f * h * w
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
-            s, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
+        # angles for the full (un-sharded) sequence
+        angles_full = torch.cat(
+            [
+                freqs_f[:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs_h[:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs_w[:w].view(1, 1, w, -1).expand(f, h, w, -1),
+            ],
+            dim=-1,
+        ).reshape(token_len, 1, c)
 
-        # apply rotary embedding
-        sp_size = get_world_size()
-        sp_rank = get_rank()
-        freqs_i = pad_freqs(freqs_i, s * sp_size)
-        s_per_rank = s
-        freqs_i_rank = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) *
-                                                       s_per_rank), :, :]
-        x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
+        # pad to s*sp_size with zero angles → identity rotation on tail
+        if full_s > token_len:
+            pad = angles_full.new_zeros(full_s - token_len, 1, c)
+            angles_full = torch.cat([angles_full, pad], dim=0)
 
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
+        # this rank's slice
+        angles = angles_full[sp_rank * s:(sp_rank + 1) * s]   # [s, 1, c]
+        cos = torch.cos(angles)                                # [s, 1, c]
+        sin = torch.sin(angles)                                # [s, 1, c]
+
+        x_head = x_compute[i].reshape(s, N, c, 2)             # [s, N, c, 2]
+        x0 = x_head[:, :, :, 0]                               # [s, N, c]
+        x1 = x_head[:, :, :, 1]                               # [s, N, c]
+
+        y0 = x0 * cos - x1 * sin
+        y1 = x0 * sin + x1 * cos
+
+        # interleave + masked write to avoid view_as_complex / stack-flatten
+        y0e = y0.repeat_interleave(2, dim=-1)                 # [s, N, D]
+        y1e = y1.repeat_interleave(2, dim=-1)                 # [s, N, D]
+        x_rot = y0e * even_mask + y1e * odd_mask              # [s, N, D]
+
+        out.append(x_rot)
+
+    return torch.stack(out, dim=0).to(dtype=x.dtype)
 
 
 def sp_dit_forward(
@@ -96,17 +128,17 @@ def sp_dit_forward(
         for u in x
     ])
 
-    # time embeddings
+    # time embeddings — explicit fp32 (was a CUDA-typed autocast block; cast directly
+    # so the path works on the Native Neuron device too)
     if t.dim() == 1:
         t = t.expand(t.size(0), seq_len)
-    with torch.amp.autocast('cuda', dtype=torch.float32):
-        bt = t.size(0)
-        t = t.flatten()
-        e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim,
-                                    t).unflatten(0, (bt, seq_len)).float())
-        e0 = self.time_projection(e).unflatten(2, (6, self.dim))
-        assert e.dtype == torch.float32 and e0.dtype == torch.float32
+    bt = t.size(0)
+    t = t.flatten()
+    e = self.time_embedding(
+        sinusoidal_embedding_1d(self.freq_dim,
+                                t).unflatten(0, (bt, seq_len)).float()).float()
+    e0 = self.time_projection(e).unflatten(2, (6, self.dim)).float()
+    assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
     # context
     context_lens = None
@@ -159,8 +191,8 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
         return q, k, v
 
     q, k, v = qkv_fn(x)
-    q = rope_apply(q, grid_sizes, freqs)
-    k = rope_apply(k, grid_sizes, freqs)
+    q = rope_apply(q, grid_sizes, freqs, self.even_mask, self.odd_mask)
+    k = rope_apply(k, grid_sizes, freqs, self.even_mask, self.odd_mask)
 
     x = distributed_attention(
         half(q),

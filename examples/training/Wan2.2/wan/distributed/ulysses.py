@@ -2,7 +2,7 @@
 import torch
 import torch.distributed as dist
 
-from ..modules.attention import flash_attention
+from ..modules.attention import attention
 from .util import all_to_all
 
 
@@ -33,8 +33,8 @@ def distributed_attention(
     k = all_to_all(k, scatter_dim=2, gather_dim=1)
     v = all_to_all(v, scatter_dim=2, gather_dim=1)
 
-    # apply attention
-    x = flash_attention(
+    # apply attention (device-agnostic wrapper: flash_attn on CUDA, SDPA elsewhere)
+    x = attention(
         q,
         k,
         v,

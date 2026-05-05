@@ -3,11 +3,20 @@ import torch
 import torch.distributed as dist
 
 
-def init_distributed_group():
-    """r initialize sequence parallel group.
+def init_distributed_group(backend=None):
+    """Initialize sequence parallel group.
+
+    No-op if a process group is already initialized (which is the normal
+    path — generate_rolling.py calls init_process_group before this).
     """
     if not dist.is_initialized():
-        dist.init_process_group(backend='nccl')
+        if backend is None:
+            available = list(dist.Backend.backend_list)
+            for candidate in ("neuron", "nccl", "gloo"):
+                if candidate in available:
+                    backend = candidate
+                    break
+        dist.init_process_group(backend=backend)
 
 
 def get_rank():

@@ -97,6 +97,11 @@ def _parse_args():
     parser.add_argument(
         "--save_file", type=str, default=None,
         help="Output .mp4 path. Auto-named if not specified.")
+    parser.add_argument(
+        "--verbose", action="store_true", default=False,
+        help="Emit lightweight per-chunk diagnostic signals on rank 0 "
+             "(timings, latent stats). Off by default to avoid contaminating "
+             "benchmarks with extra reductions or syncs.")
     return parser.parse_args()
 
 
@@ -122,8 +127,8 @@ def main():
         if args.device == "cuda":
             backend = "nccl"
         elif args.device == "neuron":
-            import torch_xla.distributed.xla_backend  # registers "xla" backend
-            backend = "xla"
+            import torch_neuronx  # registers the "neuron" c10d backend
+            backend = "neuron"
         else:
             backend = "gloo"
         dist.init_process_group(
@@ -188,6 +193,7 @@ def main():
         n_prompt=args.n_prompt,
         seed=seed,
         offload_model=args.offload_model,
+        verbose=args.verbose,
     )
 
     if rank == 0 and video is not None:
