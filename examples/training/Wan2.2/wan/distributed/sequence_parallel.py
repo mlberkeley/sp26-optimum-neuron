@@ -128,17 +128,18 @@ def sp_dit_forward(
         for u in x
     ])
 
-    # time embeddings — explicit fp32 (was a CUDA-typed autocast block; cast directly
-    # so the path works on the Native Neuron device too)
+    # time embeddings — match the param dtype on entry so the Linear matmul
+    # has consistent dtypes (the Native Neuron MLIR rejects mixed-dtype mm).
+    # Mirrors the single-device path at wan/modules/model.py:606-609.
     if t.dim() == 1:
         t = t.expand(t.size(0), seq_len)
     bt = t.size(0)
     t = t.flatten()
+    param_dtype = next(self.time_embedding.parameters()).dtype
     e = self.time_embedding(
         sinusoidal_embedding_1d(self.freq_dim,
-                                t).unflatten(0, (bt, seq_len)).float()).float()
-    e0 = self.time_projection(e).unflatten(2, (6, self.dim)).float()
-    assert e.dtype == torch.float32 and e0.dtype == torch.float32
+                                t).unflatten(0, (bt, seq_len)).to(param_dtype))
+    e0 = self.time_projection(e).unflatten(2, (6, self.dim))
 
     # context
     context_lens = None
