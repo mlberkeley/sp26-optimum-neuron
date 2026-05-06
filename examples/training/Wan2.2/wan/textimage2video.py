@@ -735,6 +735,84 @@ class WanTI2V:
         all_pixel_frames = []  # accumulated on CPU per chunk
         chunk_timings = []  # [(chunk_idx, t_chunk_s, t_per_step_s, anchor_norm, last_norm), ...]
         import time as _time
+        import concurrent.futures as _cf
+
+        # V1: pipeline VAE-decode of chunk N with denoising of chunk N+1.
+        # The decode of chunk N depends only on its final latent (not on any
+        # subsequent chunk), and the denoise of chunk N+1 depends only on the
+        # boundary latent frame (also captured before the decode runs). So
+        # offloading decode to a CPU thread pool lets the next chunk's
+        # denoise on Neuron overlap with the current chunk's CPU VAE work,
+        # which is the dominant phase at f81.
+        # Disable with WAN_VAE_PIPELINE=0; auto-on for rank-0, n_chunks > 1.
+        _vae_pipeline_on = (
+            self.rank == 0
+            and not skip_decode
+            and n_chunks > 1
+            and os.environ.get("WAN_VAE_PIPELINE", "1").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        _vae_executor = (
+            _cf.ThreadPoolExecutor(max_workers=1) if _vae_pipeline_on else None
+        )
+        _vae_futures = []  # list of (chunk_idx, future) — order-preserving
+
+        # V2: optional spatial-tiled VAE on Neuron. Only active on rank 0
+        # (rank 0 is the only rank that decodes), only when the user
+        # explicitly enables WAN_VAE_NEURON_TILED=1, and only when the
+        # device is "neuron" (otherwise the CPU path is correct already).
+        # Halo defaults to 10 latent px (matches the production halo
+        # validated by tests/vae/test_tiled_decode.py); override with
+        # WAN_VAE_NEURON_TILED_HALO if needed.
+        _vae_neuron_tiled_on = (
+            self.rank == 0
+            and not skip_decode
+            and self.device == "neuron"
+            and os.environ.get("WAN_VAE_NEURON_TILED", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        _vae_tiled_halo = int(os.environ.get("WAN_VAE_NEURON_TILED_HALO", "10"))
+
+        if _vae_neuron_tiled_on:
+            # Migrate VAE to neuron once (mirrors probe_vae_neuron.py).
+            # On the first chunk we lazily move the inner model + scale; on
+            # subsequent chunks the move is a no-op.
+            if not getattr(self.vae.model, "_on_neuron", False):
+                self.vae.model.to("neuron")
+                if hasattr(self.vae, "scale") and isinstance(self.vae.scale, list):
+                    self.vae.scale = [
+                        t.to("neuron") if torch.is_tensor(t) else t
+                        for t in self.vae.scale
+                    ]
+                self.vae.model._on_neuron = True
+
+        def _decode_chunk(_latent, _chunk_idx_local):
+            """Worker: run VAE decode and trim boundary frame.
+
+            In the default path, `_latent` is a CPU tensor and we use the
+            wrapper's CPU decode. Under WAN_VAE_NEURON_TILED=1, `_latent`
+            is on Neuron and we route through tiled_decode (which itself
+            moves output back to CPU before returning). Either way, the
+            return is a CPU pixel tensor.
+            """
+            if _vae_neuron_tiled_on:
+                from wan.vae import tiled_decode  # local import: lazy on rank-0
+                # The tiled wrapper expects a 5D latent batch; the rolling
+                # path keeps `_latent` as 4D `[C, F_lat, H_lat, W_lat]`.
+                tiled_out = tiled_decode(
+                    self.vae.model,
+                    _latent.unsqueeze(0),
+                    self.vae.scale,
+                    halo_lat=_vae_tiled_halo,
+                )
+                _frames_cpu = tiled_out.float().clamp_(-1, 1).squeeze(0)
+            else:
+                _chunk_video = self.vae.decode([_latent])
+                _frames_cpu = _chunk_video[0]
+            if _chunk_idx_local > 0:
+                # drop duplicate boundary frame — pinned as anchor of next chunk
+                _frames_cpu = _frames_cpu[:, 1:, :, :]
+            return _frames_cpu.cpu()
 
         with (
             torch.no_grad(),
@@ -835,25 +913,48 @@ class WanTI2V:
                         f"anchor|x|={_anchor_norm:.4f}, last|x|={_last_norm:.4f}"
                     )
 
-                # decode this chunk immediately to free latent memory
-                if self.rank == 0 and not skip_decode:
-                    chunk_video = self.vae.decode([latent.to(self.vae_device)])  # [C, F_px, H, W]
-                    frames = chunk_video[0]
-                    if chunk_idx > 0:
-                        # drop the duplicate boundary frame (== last frame of
-                        # the previous chunk, pinned as the anchor)
-                        frames = frames[:, 1:, :, :]
-                    all_pixel_frames.append(frames.cpu())
-
-                # the last latent frame becomes the anchor for the next chunk;
-                # shape [C, 1, H_lat, W_lat] matches z[0] from vae.encode
+                # capture the anchor for the NEXT chunk's denoise BEFORE we
+                # hand the latent off to the CPU VAE — that decoupling is
+                # what lets V1 pipelining work.
                 if chunk_idx < n_chunks - 1:
                     anchor_z = latent[:, -1:, :, :].clone()
+
+                if self.rank == 0 and not skip_decode:
+                    if _vae_neuron_tiled_on:
+                        # V2: keep latent on neuron — tiled_decode runs on
+                        # device. We can't pipeline into a thread pool here
+                        # because Neuron device contexts aren't thread-safe
+                        # for our purposes; decode synchronously.
+                        all_pixel_frames.append(
+                            _decode_chunk(latent.detach(), chunk_idx))
+                    else:
+                        # Move latent to CPU here on the main thread (cheap;
+                        # few MB) so the worker thread doesn't touch Neuron.
+                        _latent_cpu = latent.to(self.vae_device).detach()
+                        if _vae_executor is not None:
+                            _vae_futures.append(
+                                (chunk_idx,
+                                 _vae_executor.submit(_decode_chunk,
+                                                      _latent_cpu, chunk_idx))
+                            )
+                        else:
+                            # Sync path (legacy / pipeline disabled).
+                            all_pixel_frames.append(
+                                _decode_chunk(_latent_cpu, chunk_idx))
 
                 del noise, latent, sample_scheduler
 
             if offload_model:
                 self.model.cpu()
+
+            # Drain pipelined decodes: all denoising is done, so block here
+            # until every queued chunk's VAE work finishes. Results are
+            # appended in chunk-order so all_pixel_frames stays consistent
+            # with the sync-path accumulation order.
+            if _vae_executor is not None:
+                for _idx, _fut in sorted(_vae_futures, key=lambda kv: kv[0]):
+                    all_pixel_frames.append(_fut.result())
+                _vae_executor.shutdown(wait=True)
 
         result = (torch.cat(all_pixel_frames, dim=1)
                   if (self.rank == 0 and not skip_decode and all_pixel_frames)
