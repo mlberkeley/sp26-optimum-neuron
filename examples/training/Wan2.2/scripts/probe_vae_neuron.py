@@ -59,21 +59,30 @@ def main() -> int:
         _emit_blocked(f"latent build failed: {type(e).__name__}: {e}")
         return 1
 
-    print("[probe] moving VAE -> neuron")
+    print("[probe] moving VAE -> neuron (model + scale tensors)")
     try:
         vae.model.to("neuron")
+        # Wan2_2_VAE keeps self.scale = [mean, 1/std] tensors on the construction
+        # device. The .decode() call uses these alongside the latent, so they
+        # must move too — otherwise we get a device-mismatch before any real
+        # VAE op is exercised.
+        if hasattr(vae, "scale") and isinstance(vae.scale, list):
+            vae.scale = [t.to("neuron") if torch.is_tensor(t) else t for t in vae.scale]
+        # Bypass the wrapper's `with torch.amp.autocast('cpu', ...)` since CPU
+        # autocast is meaningless on a Neuron tensor and may itself error.
     except Exception as e:
-        _emit_blocked(f"vae.model.to('neuron') failed: {type(e).__name__}: {e}\n"
+        _emit_blocked(f"vae move-to-neuron failed: {type(e).__name__}: {e}\n"
                       f"{traceback.format_exc(limit=4)}")
         return 1
 
-    print("[probe] dispatching VAE.decode([z]) on neuron")
+    print("[probe] dispatching VAE.model.decode(z) on neuron")
     try:
         z_dev = z.to("neuron")
-        out = vae.decode([z_dev])
-        if isinstance(out, list):
-            out = out[0]
-        out_cpu = out.to("cpu").float()
+        # Call the inner model.decode directly to skip the CPU autocast guard
+        # in the wrapper. Mirrors what wrapper.decode does, just without amp.
+        out = vae.model.decode(z_dev.unsqueeze(0), vae.scale)
+        out = out.float().clamp_(-1, 1).squeeze(0)
+        out_cpu = out.to("cpu")
         print(f"[probe] decode succeeded; output shape={tuple(out_cpu.shape)}, "
               f"finite={torch.isfinite(out_cpu).all().item()}")
         print("[PROBE:VAE_NEURON_OK]")
