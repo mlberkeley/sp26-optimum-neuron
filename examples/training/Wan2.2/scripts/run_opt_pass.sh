@@ -48,7 +48,14 @@ echo "" | tee -a "$LOG"
 declare -A SPEEDUP
 declare -A VERDICT  # "INTEGRATE" | "SKIP_LOW_SPEEDUP" | "SKIP_NO_DATA" | "SKIP_FAILED"
 
-for kernel in rmsnorm rope attention; do
+# Candidate set is dynamic: layernorm is included only if its test file landed
+# in time (writer-agent runs concurrently with the chain).
+CANDIDATES=(rmsnorm rope attention)
+if [ -f "tests/kernels/test_layernorm_nki.py" ]; then
+  CANDIDATES+=(layernorm)
+fi
+
+for kernel in "${CANDIDATES[@]}"; do
   # Most recent retest log for this kernel
   RETEST_LOG="logs/overnight/${kernel}_retest.log"
   if [ ! -f "$RETEST_LOG" ]; then
@@ -67,6 +74,7 @@ for kernel in rmsnorm rope attention; do
     rmsnorm)   LABEL_PATTERNS=("single" "sp8_rank") ;;
     rope)      LABEL_PATTERNS=("rope_sp8_rank0_bf16") ;;
     attention) LABEL_PATTERNS=("self_attn_full_5B" "self_attn_sp_post_a2a" "cross_attn") ;;
+    layernorm) LABEL_PATTERNS=("single" "sp8_rank") ;;
   esac
   BEST_SPEEDUP=""
   for lbl in "${LABEL_PATTERNS[@]}"; do
@@ -100,7 +108,7 @@ done
   echo ""
   echo "| Kernel | Best Speedup | Verdict | Notes |"
   echo "|---|---|---|---|"
-  for k in rmsnorm rope attention; do
+  for k in "${CANDIDATES[@]}"; do
     v="${VERDICT[$k]}"
     s="${SPEEDUP[$k]}"
     case "$v" in
@@ -119,12 +127,13 @@ echo "" | tee -a "$LOG"
 # ---- Phase C: build per-kernel env toggles for the e2e run ----
 INTEG_ENV=()
 INTEG_LIST=()
-for k in rmsnorm rope attention; do
+for k in "${CANDIDATES[@]}"; do
   if [ "${VERDICT[$k]}" = "INTEGRATE" ]; then
     case "$k" in
       rmsnorm)   INTEG_ENV+=("WAN_NKI_RMSNORM=1") ;;
       rope)      INTEG_ENV+=("WAN_NKI_ROPE=1") ;;
       attention) INTEG_ENV+=("WAN_NKI_ATTENTION=1") ;;
+      layernorm) INTEG_ENV+=("WAN_NKI_LAYERNORM=1") ;;
     esac
     INTEG_LIST+=("$k")
   else
@@ -132,26 +141,33 @@ for k in rmsnorm rope attention; do
       rmsnorm)   INTEG_ENV+=("WAN_NKI_RMSNORM=0") ;;
       rope)      INTEG_ENV+=("WAN_NKI_ROPE=0") ;;
       attention) INTEG_ENV+=("WAN_NKI_ATTENTION=0") ;;
+      layernorm) INTEG_ENV+=("WAN_NKI_LAYERNORM=0") ;;
     esac
   fi
 done
 
+NUM_CANDIDATES=${#CANDIDATES[@]}
 NUM_INTEGRATIONS=${#INTEG_LIST[@]}
 echo "Integrations to validate: ${NUM_INTEGRATIONS} (${INTEG_LIST[*]:-none})" | tee -a "$LOG"
 echo "" | tee -a "$LOG"
 
-# ---- Phase D: e2e validation ----
+# ---- Phase D: combined e2e validation ----
+# Per-kernel correctness was already verified atomically in the kernel retest
+# (each test_<kernel>_nki.py compares against the torch reference at the
+# actual TI2V-5B shapes). Since each kernel is a drop-in replacement, the
+# only remaining question is "does integration not regress the e2e" — one
+# combined run answers that.
+
 if [ "$NUM_INTEGRATIONS" -eq 0 ]; then
-  echo "[ALERT:OPT_PASS_PARTIAL] 0/3 — no kernel cleared the ${GATE_THRESHOLD}× gate; skipping e2e validation"
+  echo "[ALERT:OPT_PASS_PARTIAL] 0/${NUM_CANDIDATES} — no kernel cleared the ${GATE_THRESHOLD}× gate; skipping e2e validation"
   exit 0
 fi
 
 E2E_TAG="kernel_e2e_$(printf %s_ "${INTEG_LIST[@]}" | sed 's/_$//')"
-E2E_LOG="logs/overnight/opt_e2e.log"
 E2E_MP4="$ROOT/outputs/sweep_sp8_f81_s8_n1_${E2E_TAG}.mp4"
 E2E_DEDICATED_LOG="$ROOT/logs/sweep_sp8_f81_s8_n1_${E2E_TAG}.log"
 
-echo "--- e2e validation: SP=8 f=81 s=8 n=1, ${INTEG_LIST[*]} ON ---" | tee -a "$LOG"
+echo "--- combined e2e: SP=8 f=81 s=8 n=1, ${INTEG_LIST[*]} ON ---" | tee -a "$LOG"
 echo "tag=${E2E_TAG} log=${E2E_DEDICATED_LOG}" | tee -a "$LOG"
 
 T0=$(date +%s)
@@ -169,11 +185,8 @@ EXIT=$?
 T1=$(date +%s)
 DUR=$((T1 - T0))
 
-# Capture last|x| if present (rank-0 prints it via verbose logging)
 LAST_X=$(grep -oE "last\|x\| ?= ?[0-9]+\.[0-9]+" "$E2E_DEDICATED_LOG" | tail -1 | sed -E 's/.*= *//')
 
-# Append to canonical sweep CSV
-SUMMARY="$ROOT/outputs/sweep_summary.csv"
 if [ "$EXIT" -eq 0 ] && grep -q "\[skip_decode\] denoising done" "$E2E_DEDICATED_LOG"; then
   STATUS="ok_no_decode"
 elif grep -qE "OutOfMemory|out of memory|OOM|HBM_OOM|dmem_alloc_internal|Failed to allocate aligned|MLA DRAM|nrt_tensor_allocate.*failed" "$E2E_DEDICATED_LOG"; then
@@ -181,21 +194,31 @@ elif grep -qE "OutOfMemory|out of memory|OOM|HBM_OOM|dmem_alloc_internal|Failed 
 else
   STATUS="error_${EXIT}"
 fi
-echo "${E2E_TAG},8,81,8,1,${DUR},${STATUS},${E2E_MP4}" >> "$SUMMARY"
+echo "${E2E_TAG},8,81,8,1,${DUR},${STATUS},${E2E_MP4}" >> "$ROOT/outputs/sweep_summary.csv"
 
 echo "" | tee -a "$LOG"
 echo "=== opt_pass e2e summary $(date -u +%FT%TZ) ===" | tee -a "$LOG"
 echo "  exit=${EXIT} duration=${DUR}s status=${STATUS} last|x|=${LAST_X:-?}" | tee -a "$LOG"
 
+# Append e2e verdict to inventory
+{
+  echo ""
+  echo "## Combined E2E (SP=8 f=81 s=8 n=1, --skip_decode)"
+  echo ""
+  echo "Integrations ON: ${INTEG_LIST[*]}"
+  echo "Result: status=${STATUS} duration=${DUR}s last|x|=${LAST_X:-?}"
+  echo "Tolerance: ±0.05 absolute around baseline 0.7043 (no-NKI ground truth)."
+} >> "$INVENTORY"
+
 # ---- Phase E: emit final alert ----
+LASTX_LO=0.65
+LASTX_HI=0.75
 if [ "$EXIT" -eq 0 ] && [ "$STATUS" = "ok_no_decode" ]; then
-  # Reference last|x| at SP=8 f=81 s=8 n=1 (no NKI patches) is 0.7043 from PROGRESS.md.
-  # Tolerance: ±0.05 absolute (bf16 numerical drift across kernels is acceptable).
-  if [ -n "$LAST_X" ] && awk "BEGIN{exit !(($LAST_X > 0.65) && ($LAST_X < 0.75))}"; then
-    echo "[ALERT:OPT_PASS_OK] ${NUM_INTEGRATIONS}/3 kernels integrated (${INTEG_LIST[*]}); e2e last|x|=${LAST_X} within ±0.05 of baseline 0.7043"
+  if [ -n "$LAST_X" ] && awk "BEGIN{exit !(($LAST_X >= $LASTX_LO) && ($LAST_X <= $LASTX_HI))}"; then
+    echo "[ALERT:OPT_PASS_OK] ${NUM_INTEGRATIONS}/${NUM_CANDIDATES} kernels integrated (${INTEG_LIST[*]}); combined e2e last|x|=${LAST_X} within ±0.05 of baseline 0.7043"
   else
-    echo "[ALERT:OPT_PASS_PARTIAL] ${NUM_INTEGRATIONS}/3 integrated, e2e ran but last|x|=${LAST_X:-?} outside tolerance — numerical regression"
+    echo "[ALERT:OPT_PASS_PARTIAL] ${NUM_INTEGRATIONS}/${NUM_CANDIDATES} integrated; combined e2e ran but last|x|=${LAST_X:-?} outside tolerance — numerical regression"
   fi
 else
-  echo "[ALERT:OPT_PASS_PARTIAL] ${NUM_INTEGRATIONS}/3 integrated, e2e failed (status=${STATUS}, exit=${EXIT})"
+  echo "[ALERT:OPT_PASS_PARTIAL] ${NUM_INTEGRATIONS}/${NUM_CANDIDATES} integrated; combined e2e failed (status=${STATUS}, exit=${EXIT}); see ${E2E_DEDICATED_LOG}"
 fi

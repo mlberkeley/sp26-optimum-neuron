@@ -72,6 +72,32 @@ def _patch_rmsnorm() -> None:
     logger.info("[wan.kernels] swapped wan.modules.model.WanRMSNorm -> NKI")
 
 
+def _patch_layernorm() -> None:
+    from wan.modules import model as wan_model
+    from wan.kernels.wan_layer_norm_nki import WanLayerNormNKI
+
+    _OrigLayerNorm = wan_model.WanLayerNorm
+
+    class _PatchedLayerNorm(_OrigLayerNorm):
+        def forward(self, x):
+            if x.device.type == "neuron":
+                if not hasattr(self, "_nki_impl"):
+                    nki_impl = WanLayerNormNKI(
+                        normalized_shape=self.normalized_shape,
+                        eps=self.eps,
+                        elementwise_affine=self.elementwise_affine,
+                    )
+                    if self.elementwise_affine:
+                        nki_impl.weight = self.weight
+                        nki_impl.bias = self.bias
+                    self._nki_impl = nki_impl
+                return self._nki_impl(x)
+            return super().forward(x)
+
+    wan_model.WanLayerNorm = _PatchedLayerNorm
+    logger.info("[wan.kernels] swapped wan.modules.model.WanLayerNorm -> NKI")
+
+
 def _patch_rope() -> None:
     from wan.modules import model as wan_model
     from wan.distributed import sequence_parallel as sp_mod
@@ -113,6 +139,12 @@ def apply() -> None:
             enabled.append("rmsnorm")
         except Exception as e:
             logger.warning("[wan.kernels] rmsnorm patch failed: %r", e)
+    if _enabled("WAN_NKI_LAYERNORM", default=True):
+        try:
+            _patch_layernorm()
+            enabled.append("layernorm")
+        except Exception as e:
+            logger.warning("[wan.kernels] layernorm patch failed: %r", e)
     if _enabled("WAN_NKI_ROPE", default=True):
         try:
             _patch_rope()

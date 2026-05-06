@@ -28,6 +28,12 @@ run_one() {
 run_one rmsnorm test_rmsnorm_nki.py
 run_one rope     test_rope_nki.py
 run_one attention test_attention_nki.py
+# layernorm is opportunistic — only runs if the writer-agent landed it
+if [ -f "tests/kernels/test_layernorm_nki.py" ]; then
+  run_one layernorm test_layernorm_nki.py
+else
+  echo "(layernorm test file not present; skipping)"
+fi
 
 echo "=== retest summary $(date -u +%FT%TZ) ==="
 for k in "${!R[@]}"; do
