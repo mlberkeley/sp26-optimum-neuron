@@ -636,6 +636,7 @@ class WanTI2V:
         seed=-1,
         offload_model=True,
         verbose=False,
+        skip_decode=False,
     ):
         r"""
         Generates a long video by chaining TI2V chunks sequentially.
@@ -835,7 +836,7 @@ class WanTI2V:
                     )
 
                 # decode this chunk immediately to free latent memory
-                if self.rank == 0:
+                if self.rank == 0 and not skip_decode:
                     chunk_video = self.vae.decode([latent.to(self.vae_device)])  # [C, F_px, H, W]
                     frames = chunk_video[0]
                     if chunk_idx > 0:
@@ -855,7 +856,8 @@ class WanTI2V:
                 self.model.cpu()
 
         result = (torch.cat(all_pixel_frames, dim=1)
-                  if self.rank == 0 else None)
+                  if (self.rank == 0 and not skip_decode and all_pixel_frames)
+                  else None)
 
         del all_pixel_frames
         if offload_model:

@@ -102,6 +102,10 @@ def _parse_args():
         help="Emit lightweight per-chunk diagnostic signals on rank 0 "
              "(timings, latent stats). Off by default to avoid contaminating "
              "benchmarks with extra reductions or syncs.")
+    parser.add_argument(
+        "--skip_decode", action="store_true", default=False,
+        help="Skip the VAE decode + mp4 save (rank 0 only). Useful for OOM "
+             "sweeps where VAE on CPU dominates wall-clock for large frame counts.")
     return parser.parse_args()
 
 
@@ -194,7 +198,11 @@ def main():
         seed=seed,
         offload_model=args.offload_model,
         verbose=args.verbose,
+        skip_decode=args.skip_decode,
     )
+
+    if rank == 0 and args.skip_decode:
+        logging.info("[skip_decode] denoising done; not running VAE decode / save_video.")
 
     if rank == 0 and video is not None:
         if args.save_file is None:
