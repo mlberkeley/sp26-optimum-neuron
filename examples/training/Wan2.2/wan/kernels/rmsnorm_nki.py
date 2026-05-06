@@ -60,7 +60,13 @@ Beta-2 / NKI 0.3.0 APIs used
                                               ("'bias' partition total elements
                                               1 != 'dst' partition total
                                               elements 128").
-- nisa.tensor_tensor(op=nl.multiply)       : x * inv_rms (broadcast over F)
+- nisa.tensor_scalar(op0=nl.multiply, operand0=inv_rms)
+                                            : x * inv_rms with the [P, 1]
+                                              inv_rms operand broadcast across
+                                              the free dim. `tensor_tensor`
+                                              cannot do this broadcast — the
+                                              MLIR verifier rejects
+                                              lhs.free != rhs.free.
 - nisa.tensor_scalar(op0=nl.multiply, operand0=weight_sb)
                                             : multiply per-H weight broadcast
                                               over partition axis.
@@ -159,9 +165,20 @@ def _rmsnorm_kernel(x_hbm, weight_hbm, eps):
             bias=eps_f,
         )
 
-        # x_norm_fp32 = x_fp32 * inv_rms (inv_rms broadcast across F-axis)
+        # x_norm_fp32 = x_fp32 * inv_rms (inv_rms broadcast across F-axis).
+        # `nisa.tensor_tensor` requires lhs/rhs to share the same free
+        # dimension — passing rhs=[P, 1] vs dst=[P, H] is rejected by the
+        # MLIR verifier with "'dst' free total elements H != 'rhs' free
+        # total elements 1". `nisa.tensor_scalar` is the broadcast-friendly
+        # equivalent: it accepts a `(P, 1)` operand and broadcasts on the
+        # free dim natively.
         x_norm_fp32 = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=x_norm_fp32, data1=x_tile, data2=inv_rms, op=nl.multiply)
+        nisa.tensor_scalar(
+            dst=x_norm_fp32,
+            data=x_tile,
+            op0=nl.multiply,
+            operand0=inv_rms,
+        )
 
         # WanRMSNorm casts back to input dtype here, then multiplies by
         # weight. Mirror that round-trip so the numeric profile matches.
