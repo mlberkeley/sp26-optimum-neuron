@@ -1,0 +1,230 @@
+"""Unit + (gated) on-device test for `WanLayerNormNKI`.
+
+Compares `WanLayerNormNKI` to the original `WanLayerNorm` for the realistic
+shapes used in TI2V-5B training:
+
+    single device:  [1, 4400, 3072] bf16
+    SP=8 per-rank:  [1,  550, 3072] bf16
+
+Both shapes are exercised in two modes:
+    - elementwise_affine=False (norm1, norm2, head.norm)  — DEFAULT in WanLayerNorm
+    - elementwise_affine=True  (norm3, cross_attn_norm)
+
+Both go through `_compare_one`, which:
+  1. Runs both modules on the same input.
+  2. Compares numerics with bf16-appropriate tolerances.
+  3. (If RUN_KERNEL_BENCH=1) calls `run_compare` from `_bench.py` to time
+     both implementations on device.
+
+By default the test runs on CPU and exercises the PyTorch fallback path
+(so the file imports on any host). Set `NEURON_KERNEL_TEST=1` to run on
+the Neuron / XLA device — that path actually invokes the NKI kernel.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+import torch
+
+# Allow running directly via `python tests/kernels/test_layernorm_nki.py`
+import sys
+_PKG_ROOT = Path(__file__).resolve().parents[2]
+if str(_PKG_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PKG_ROOT))
+
+from wan.modules.model import WanLayerNorm  # noqa: E402
+from wan.kernels.wan_layer_norm_nki import WanLayerNormNKI  # noqa: E402
+
+from tests.kernels._bench import (  # noqa: E402
+    numerics,
+    run_compare,
+    should_run_bench,
+)
+
+
+# bf16 LayerNorm with fp32 internals: 5e-2 abs / 5e-2 rel matches the
+# tolerance other Wan kernel tests (e.g. test_rmsnorm_nki) use for bf16.
+_ABS_TOL = 5e-2
+_REL_TOL = 5e-2
+
+
+def _device():
+    """Pick neuron device only when explicitly enabled."""
+    if os.environ.get("NEURON_KERNEL_TEST") == "1":
+        try:
+            import torch_xla.core.xla_model as xm  # noqa: F401
+            return torch.device("xla")
+        except Exception:
+            # Fall back to neuron device string if torch_xla is not present.
+            return torch.device("neuron")
+    return torch.device("cpu")
+
+
+def _make_modules(
+    dim: int, eps: float, elementwise_affine: bool, device: torch.device
+):
+    """Return a (reference, candidate) pair sharing weights (if any)."""
+    torch.manual_seed(0)
+    ref = WanLayerNorm(dim=dim, eps=eps, elementwise_affine=elementwise_affine)
+    cand = WanLayerNormNKI(
+        dim=dim, eps=eps, elementwise_affine=elementwise_affine
+    )
+    if elementwise_affine:
+        # Match parameters so the comparison is meaningful. nn.LayerNorm
+        # initializes weight=1, bias=0, but explicit copy guards against
+        # default changes and lets us perturb weights in future tests.
+        with torch.no_grad():
+            cand.weight.copy_(ref.weight)
+            cand.bias.copy_(ref.bias)
+    return ref.to(device), cand.to(device)
+
+
+def _compare_one(
+    label: str,
+    B: int,
+    L: int,
+    H: int,
+    eps: float,
+    elementwise_affine: bool,
+):
+    device = _device()
+    ref, cand = _make_modules(H, eps, elementwise_affine, device)
+    torch.manual_seed(123)
+    x = torch.randn(B, L, H, dtype=torch.bfloat16, device=device)
+
+    with torch.no_grad():
+        out_ref = ref(x)
+        out_cand = cand(x)
+
+    # Move to CPU for the comparison so we don't generate stray XLA graphs.
+    a = out_ref.detach().to("cpu")
+    b = out_cand.detach().to("cpu")
+
+    max_abs, rel_inf = numerics(a, b)
+    print(
+        f"[{label}] shape=({B},{L},{H}) eps={eps} affine={elementwise_affine} "
+        f"maxabs={max_abs:.3e} relinf={rel_inf:.3e}"
+    )
+    assert max_abs <= _ABS_TOL, (
+        f"{label}: |ref - nki|_inf = {max_abs:.3e} exceeds {_ABS_TOL:.1e}"
+    )
+    assert rel_inf <= _REL_TOL, (
+        f"{label}: rel_inf = {rel_inf:.3e} exceeds {_REL_TOL:.1e}"
+    )
+
+    if should_run_bench() and device.type != "cpu":
+        result = run_compare(
+            label=label,
+            ref_fn=lambda t: ref(t),
+            kernel_fn=lambda t: cand(t),
+            args=(x,),
+            shape=(B, L, H),
+            dtype="bf16",
+        )
+        print(result.line())
+
+
+# --- shape coverage tests -----------------------------------------------
+def test_single_device_shape():
+    """TI2V-5B single-device norm1/norm2 shape: [1, 4400, 3072], no affine."""
+    _compare_one(
+        "single", B=1, L=4400, H=3072, eps=1e-6, elementwise_affine=False
+    )
+
+
+def test_sp_per_rank_shape():
+    """SP=8 per-rank norm1/norm2 shape: [1, 550, 3072], no affine."""
+    _compare_one(
+        "sp8_rank", B=1, L=550, H=3072, eps=1e-6, elementwise_affine=False
+    )
+
+
+def test_single_device_shape_affine():
+    """TI2V-5B single-device norm3 shape: [1, 4400, 3072] WITH affine."""
+    _compare_one(
+        "single_affine",
+        B=1, L=4400, H=3072, eps=1e-6, elementwise_affine=True,
+    )
+
+
+def test_sp_per_rank_shape_affine():
+    """SP=8 per-rank norm3 shape: [1, 550, 3072] WITH affine."""
+    _compare_one(
+        "sp8_rank_affine",
+        B=1, L=550, H=3072, eps=1e-6, elementwise_affine=True,
+    )
+
+
+# --- CPU import / fallback tests ----------------------------------------
+def test_module_on_cpu_is_safe_to_import():
+    """The NKI module must be importable + runnable on CPU.
+
+    On CPU we hit the PyTorch fallback path. Verifies the file works in
+    test envs without the Neuron toolchain. Both affine and no-affine
+    variants are checked.
+    """
+    if _device().type != "cpu":
+        pytest.skip("Only meaningful when NEURON_KERNEL_TEST is unset.")
+
+    for affine in (False, True):
+        ref = WanLayerNorm(dim=64, eps=1e-6, elementwise_affine=affine)
+        cand = WanLayerNormNKI(dim=64, eps=1e-6, elementwise_affine=affine)
+        if affine:
+            with torch.no_grad():
+                cand.weight.copy_(ref.weight)
+                cand.bias.copy_(ref.bias)
+        x = torch.randn(2, 8, 64, dtype=torch.bfloat16)
+        with torch.no_grad():
+            a = ref(x)
+            b = cand(x)
+        max_abs, _ = numerics(a, b)
+        # CPU fallback delegates to F.layer_norm — should be bit-identical.
+        assert max_abs <= 1e-5, (
+            f"CPU fallback diverged from WanLayerNorm "
+            f"(affine={affine}): {max_abs:.3e}"
+        )
+
+
+def test_default_eps_class_default():
+    """Sanity check at the WanLayerNorm class default eps=1e-6 (no affine)."""
+    _compare_one(
+        "default_eps", B=1, L=550, H=3072, eps=1e-6, elementwise_affine=False
+    )
+
+
+def test_weight_bias_must_be_paired():
+    """nki_layernorm rejects passing only one of weight/bias (mirrors
+    torch.nn.LayerNorm's elementwise_affine semantics)."""
+    if _device().type != "cpu":
+        pytest.skip("API contract test; CPU-only.")
+    from wan.kernels.layernorm_nki import nki_layernorm
+    x = torch.randn(1, 4, 128, dtype=torch.bfloat16)
+    w = torch.ones(128, dtype=torch.float32)
+    with pytest.raises(ValueError, match="both be None or both be"):
+        nki_layernorm(x, w, None, eps=1e-6)
+    with pytest.raises(ValueError, match="both be None or both be"):
+        nki_layernorm(x, None, w, eps=1e-6)
+
+
+def test_h_alignment_check():
+    """nki_layernorm requires H % 128 == 0."""
+    if _device().type != "cpu":
+        pytest.skip("API contract test; CPU-only.")
+    from wan.kernels.layernorm_nki import nki_layernorm
+    x = torch.randn(1, 4, 100, dtype=torch.bfloat16)  # 100 % 128 != 0
+    with pytest.raises(ValueError, match="H % 128"):
+        nki_layernorm(x, None, None, eps=1e-6)
+
+
+if __name__ == "__main__":
+    test_module_on_cpu_is_safe_to_import()
+    test_weight_bias_must_be_paired()
+    test_h_alignment_check()
+    test_single_device_shape()
+    test_sp_per_rank_shape()
+    test_single_device_shape_affine()
+    test_sp_per_rank_shape_affine()
+    test_default_eps_class_default()
+    print("All LayerNorm NKI tests passed.")
