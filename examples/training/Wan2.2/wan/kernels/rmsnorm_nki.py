@@ -2,19 +2,25 @@
 
 Mathematical contract (matches `wan.modules.model.WanRMSNorm`):
     y = (x.float() * rsqrt(mean(x.float()^2) + eps)).to(x.dtype) * weight
-where the reduction and rsqrt run in fp32, weight is fp32, and the
-intermediate `x_norm` is cast back to the input dtype (bf16) BEFORE the
-final multiply by `weight`. PyTorch then promotes that bf16*fp32 multiply
-back to fp32 internally and returns a tensor whose dtype follows
-`x.float() * fp32_weight` -> fp32, but `WanRMSNorm.forward` returns this
-fp32 tensor as-is (the parent block in `model.py` casts it back to bf16
-when needed). We mirror this exactly: kernel returns fp32.
+The kernel handles only the normalize half (reduction + rsqrt + multiply
+by inv_rms, then cast back to input dtype). The final `* weight` happens
+in torch on the kernel output — this is required because
+`nisa.tensor_scalar` requires `operand0.free == 1`, so a `[1, H]` weight
+broadcast across the partition axis is not legal (MLIR verifier rejects:
+"'operand0' free dimensions total elements must be 1, got 3072"). The
+alternative (broadcasting weight to `[128, H]` with `nl.broadcast_to`)
+costs an extra SBUF buffer per tile and a redundant copy, so doing the
+multiply in torch — which is fused with the next op by the eager runtime
+anyway — is cheaper.
 
 Shape contract:
     x      : [B, L, H]  bf16     (B*L flattened to a single token axis)
     weight : [H]        fp32
     eps    : float (1e-6 in production; PyTorch class default is 1e-5)
-    output : [B, L, H]  fp32     (matches WanRMSNorm.forward dtype)
+    output : [B, L, H]  bf16     (kernel output dtype = input dtype;
+                                  the python wrapper then multiplies by
+                                  weight, producing fp32 by torch
+                                  promotion to match WanRMSNorm.forward)
 
 Why a custom kernel instead of `nkilib.core.subkernels.rmsnorm_tkg.rmsnorm_tkg`?
     The production library kernel produces a transposed `[128, B*L, H//128]`
@@ -98,31 +104,25 @@ def div_ceil(n: int, d: int) -> int:
 
 # ----- the NKI kernel ---------------------------------------------------
 @nki.jit
-def _rmsnorm_kernel(x_hbm, weight_hbm, eps):
-    """RMSNorm forward kernel.
+def _rmsnorm_kernel(x_hbm, eps):
+    """RMSNorm forward kernel — normalize half only (no weight multiply).
 
     Args:
-        x_hbm:      [N, H]  bf16    where N = B*L, H % 128 == 0 (Wan H=3072)
-        weight_hbm: [1, H]  fp32
-        eps:        Python float — compile-time constant used as the
-                    `nisa.activation` bias. NKI passes Python scalars as
-                    scalar args (not tensors), and the activation engine
-                    on NeuronCore-v3+ accepts a scalar bias directly.
+        x_hbm:  [N, H]  any float dtype (bf16 in production); H % 128 == 0.
+                N = B*L flattened token axis.
+        eps:    Python float — compile-time constant used as the
+                `nisa.activation` bias.
 
     Returns:
-        y_hbm: [N, H] fp32 (intentional: matches WanRMSNorm.forward dtype)
+        y_hbm: [N, H] same dtype as x_hbm. The python wrapper handles the
+        `* weight` multiply afterwards (see module docstring for why).
     """
     N, H = x_hbm.shape
     TILE_N = nl.tile_size.pmax  # 128
 
-    # Output is fp32 to mirror PyTorch's `(bf16 * fp32_weight) -> fp32`
-    # promotion behavior in WanRMSNorm.forward.
-    y_hbm = nl.ndarray((N, H), dtype=nl.float32, buffer=nl.shared_hbm)
-
-    # Load weight ONCE into SBUF as [1, H] fp32. tensor_scalar will
-    # broadcast it across the partition axis as a vector operand.
-    weight_sb = nl.ndarray((1, H), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=weight_sb, src=weight_hbm[0:1, 0:H])
+    # Output dtype = input dtype. The wrapper multiplies by the fp32
+    # weight in torch, which promotes to fp32 to match WanRMSNorm.forward.
+    y_hbm = nl.ndarray((N, H), dtype=x_hbm.dtype, buffer=nl.shared_hbm)
 
     num_tiles = div_ceil(N, TILE_N)
     inv_h = 1.0 / float(H)
@@ -148,14 +148,7 @@ def _rmsnorm_kernel(x_hbm, weight_hbm, eps):
         sum_sq = nl.ndarray((n_sz, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_reduce(dst=sum_sq, data=x_sq, op=nl.add, axis=(1,))
 
-        # inv_rms = rsqrt(sum_sq * (1/H) + eps)
-        # Fused via activation engine's ScalarE pre-activation scale+bias.
-        # `bias` is a Python scalar (compile-time constant); on
-        # NeuronCore-v3+ the activation engine consumes scalars natively, and
-        # on v2 the NKI API auto-broadcasts a scalar bias to a [P, 1] vector.
-        # An [1, 1] SBUF buffer is NOT a valid bias here (MLIR verifier
-        # rejects it: "'bias' partition total elements 1 != 'dst' partition
-        # total elements 128").
+        # inv_rms = rsqrt(sum_sq * (1/H) + eps), fused via ScalarE.
         inv_rms = nl.ndarray((n_sz, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(
             dst=inv_rms,
@@ -165,13 +158,9 @@ def _rmsnorm_kernel(x_hbm, weight_hbm, eps):
             bias=eps_f,
         )
 
-        # x_norm_fp32 = x_fp32 * inv_rms (inv_rms broadcast across F-axis).
-        # `nisa.tensor_tensor` requires lhs/rhs to share the same free
-        # dimension — passing rhs=[P, 1] vs dst=[P, H] is rejected by the
-        # MLIR verifier with "'dst' free total elements H != 'rhs' free
-        # total elements 1". `nisa.tensor_scalar` is the broadcast-friendly
-        # equivalent: it accepts a `(P, 1)` operand and broadcasts on the
-        # free dim natively.
+        # x_norm_fp32 = x_fp32 * inv_rms (inv_rms is [P, 1], broadcast
+        # across F-axis via tensor_scalar — operand0.free=1 is the legal
+        # case; the H-vector broadcast case fails MLIR verify).
         x_norm_fp32 = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
             dst=x_norm_fp32,
@@ -180,24 +169,11 @@ def _rmsnorm_kernel(x_hbm, weight_hbm, eps):
             operand0=inv_rms,
         )
 
-        # WanRMSNorm casts back to input dtype here, then multiplies by
-        # weight. Mirror that round-trip so the numeric profile matches.
-        x_norm_lo = nl.ndarray((n_sz, H), dtype=x_hbm.dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=x_norm_lo, src=x_norm_fp32)
-        x_norm_back = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=x_norm_back, src=x_norm_lo)
-
-        # y = x_norm_fp32 * weight (weight broadcast over partition axis).
-        y_fp32 = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=y_fp32,
-            data=x_norm_back,
-            op0=nl.multiply,
-            operand0=weight_sb,
-        )
-
-        # Store fp32 result.
-        nisa.dma_copy(dst=y_hbm[n_start:n_end, 0:H], src=y_fp32)
+        # Cast back to input dtype to match WanRMSNorm's `(...).type_as(x)`
+        # round-trip before the weight multiply.
+        y_lo = nl.ndarray((n_sz, H), dtype=x_hbm.dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=y_lo, src=x_norm_fp32)
+        nisa.dma_copy(dst=y_hbm[n_start:n_end, 0:H], src=y_lo)
 
     return y_hbm
 
@@ -265,13 +241,11 @@ def nki_rmsnorm(
 
     # Flatten B*L for the kernel; reshape back at the end.
     x_flat = x.reshape(B * L, H).contiguous()
-    w_row = weight.to(torch.float32).reshape(1, H).contiguous()
 
-    # `eps` is passed as a Python scalar (compile-time constant). NKI
-    # forwards it to nisa.activation's `bias` arg, which the activation
-    # engine consumes directly on NeuronCore-v3+ and the NKI API
-    # auto-broadcasts to a [P, 1] vector on v2. Passing eps as a [1, 1]
-    # SBUF tensor instead fails MLIR verification because the bias
-    # partition dim must match the dst partition dim (128).
-    y_flat = _rmsnorm_kernel(x_flat, w_row, float(eps))
-    return y_flat.reshape(B, L, H)
+    # Kernel returns x_norm in input dtype (bf16). The final `* weight`
+    # is done here in torch — see module docstring on why we can't fuse
+    # the weight multiply inside the kernel (`nisa.tensor_scalar` rejects
+    # operand0.free=H>1). Torch promotes `bf16 * fp32_weight -> fp32`,
+    # matching WanRMSNorm.forward's output dtype.
+    x_norm = _rmsnorm_kernel(x_flat, float(eps)).reshape(B, L, H)
+    return x_norm * weight.to(torch.float32)

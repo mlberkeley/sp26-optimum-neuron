@@ -21,15 +21,20 @@ Shape contract:
     eps    : float                    (Wan default 1e-6 in DiT block; class default 1e-5)
     output : [B, L, H]  same dtype as x  (NOT promoted to fp32, unlike RMSNorm)
 
-Two kernel variants
--------------------
-- `_layernorm_no_affine_kernel(x, eps)`           — used when elementwise_affine=False
-                                                    (norm1, norm2, head.norm)
-- `_layernorm_affine_kernel(x, weight, bias, eps)` — used when elementwise_affine=True
-                                                     (norm3 cross_attn norm)
+Single kernel + torch-side affine
+---------------------------------
+There is one NKI kernel — `_layernorm_no_affine_kernel(x, eps)` — that does
+the normalize half (mean, variance, x_hat). When `elementwise_affine=True`
+(norm3 cross_attn norm), the `* weight + bias` is applied **in torch** on
+the kernel output; see `nki_layernorm` below.
 
-Splitting avoids passing dummy weight/bias tensors and the associated extra
-multiply/add when affine isn't used (which is 4 of the 5 DiT-block calls).
+Why not fuse weight/bias inside the kernel? `nisa.tensor_scalar` requires
+`operand0.free == 1`, so passing a `[1, H]` weight broadcast across the
+partition axis is rejected by the MLIR verifier with "'operand0' free
+dimensions total elements must be 1, got 3072". Broadcasting weight to
+`[128, H]` via `nl.broadcast_to` would work but costs an extra SBUF tile
+and copy per iteration; the eager runtime fuses the torch-side multiply
+into the next op anyway, so doing it outside is cheaper.
 
 Tiling strategy
 ---------------
@@ -221,108 +226,6 @@ def _layernorm_no_affine_kernel(x_hbm, eps):
     return y_hbm
 
 
-@nki.jit
-def _layernorm_affine_kernel(x_hbm, weight_hbm, bias_hbm, eps):
-    """LayerNorm forward with learnable affine (elementwise_affine=True).
-
-    Args:
-        x_hbm:      [N, H]  any float dtype (bf16 in production); H % 128 == 0.
-        weight_hbm: [1, H]  fp32 (gamma).
-        bias_hbm:   [1, H]  fp32 (beta).
-        eps:        Python float.
-
-    Returns:
-        y_hbm: [N, H] same dtype as x_hbm.
-    """
-    N, H = x_hbm.shape
-    TILE_N = nl.tile_size.pmax  # 128
-
-    y_hbm = nl.ndarray((N, H), dtype=x_hbm.dtype, buffer=nl.shared_hbm)
-
-    # Load weight + bias ONCE into SBUF as [1, H] fp32. tensor_scalar will
-    # broadcast them across the partition axis as vector operands.
-    weight_sb = nl.ndarray((1, H), dtype=nl.float32, buffer=nl.sbuf)
-    bias_sb = nl.ndarray((1, H), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=weight_sb, src=weight_hbm[0:1, 0:H])
-    nisa.dma_copy(dst=bias_sb, src=bias_hbm[0:1, 0:H])
-
-    num_tiles = div_ceil(N, TILE_N)
-    inv_h = 1.0 / float(H)
-    eps_f = float(eps)
-
-    for tile_idx in nl.affine_range(num_tiles):
-        n_start = tile_idx * TILE_N
-        n_end = min(n_start + TILE_N, N)
-        n_sz = n_end - n_start
-
-        x_tile_in = nl.ndarray((n_sz, H), dtype=x_hbm.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=x_tile_in, src=x_hbm[n_start:n_end, 0:H])
-
-        x_f32 = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=x_f32, src=x_tile_in)
-
-        sum_x = nl.ndarray((n_sz, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_reduce(dst=sum_x, data=x_f32, op=nl.add, axis=(1,))
-
-        mean = nl.ndarray((n_sz, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=mean, data=sum_x, op0=nl.multiply, operand0=inv_h
-        )
-
-        # `tensor_scalar` over `tensor_tensor` for the [P, H] - [P, 1]
-        # broadcast — see the no-affine kernel above for the rationale.
-        diff = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=diff,
-            data=x_f32,
-            op0=nl.subtract,
-            operand0=mean,
-        )
-
-        diff_sq = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.activation(dst=diff_sq, data=diff, op=nl.square)
-
-        sum_sq = nl.ndarray((n_sz, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_reduce(dst=sum_sq, data=diff_sq, op=nl.add, axis=(1,))
-
-        inv_std = nl.ndarray((n_sz, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.activation(
-            dst=inv_std,
-            data=sum_sq,
-            op=nl.rsqrt,
-            scale=inv_h,
-            bias=eps_f,
-        )
-
-        x_hat = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=x_hat,
-            data=diff,
-            op0=nl.multiply,
-            operand0=inv_std,
-        )
-
-        # y = x_hat * weight + bias, fused via tensor_scalar's pre-activation
-        # multiply+add. weight_sb / bias_sb are [1, H] vectors broadcast over
-        # the partition axis.
-        y_f32 = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=y_f32,
-            data=x_hat,
-            op0=nl.multiply,
-            operand0=weight_sb,
-            op1=nl.add,
-            operand1=bias_sb,
-        )
-
-        # Cast back to input dtype.
-        y_lo = nl.ndarray((n_sz, H), dtype=x_hbm.dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=y_lo, src=y_f32)
-        nisa.dma_copy(dst=y_hbm[n_start:n_end, 0:H], src=y_lo)
-
-    return y_hbm
-
-
 # ----- Python entrypoint ------------------------------------------------
 def _is_neuron_tensor(t: torch.Tensor) -> bool:
     """Return True iff `t` lives on a Neuron / XLA device."""
@@ -411,11 +314,15 @@ def nki_layernorm(
     # Flatten B*L for the kernel; reshape back at the end.
     x_flat = x.reshape(B * L, H).contiguous()
 
-    if weight is None:
-        y_flat = _layernorm_no_affine_kernel(x_flat, float(eps))
-    else:
-        w_row = weight.to(torch.float32).reshape(1, H).contiguous()
-        b_row = bias.to(torch.float32).reshape(1, H).contiguous()
-        y_flat = _layernorm_affine_kernel(x_flat, w_row, b_row, float(eps))
+    # Single kernel: normalize half only. Output dtype = input dtype.
+    y = _layernorm_no_affine_kernel(x_flat, float(eps)).reshape(B, L, H)
 
-    return y_flat.reshape(B, L, H)
+    if weight is None:
+        return y
+
+    # Affine path: do `* weight + bias` in torch on the kernel output, then
+    # cast back to x.dtype to match nn.LayerNorm's contract (output dtype
+    # equals input dtype). See module docstring for why this isn't fused
+    # inside the NKI kernel.
+    in_dtype = x.dtype
+    return (y * weight.to(torch.float32) + bias.to(torch.float32)).to(in_dtype)
