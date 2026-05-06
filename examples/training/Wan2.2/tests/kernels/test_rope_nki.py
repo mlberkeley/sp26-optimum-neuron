@@ -314,6 +314,51 @@ def test_cpu_fallback_module_safe_to_import():
     assert abs_err <= 1e-6, f"CPU fallback diverged: {abs_err:.3e}"
 
 
+# ---------- speedup benchmark (RUN_KERNEL_BENCH=1) ----------
+
+
+def test_bench_rope_sp8_rank_bf16():
+    """Bench NKI rope vs the masked-write reference at the SP=8 per-rank
+    Wan2.2-TI2V-5B 17-frame shape: [1, 550, 24, 128] bf16."""
+    device = _device()
+    if device.type == "cpu":
+        pytest.skip("Bench requires Neuron device.")
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).parent))
+    from _bench import run_compare, should_run_bench  # noqa: E402
+
+    if not should_run_bench():
+        pytest.skip("RUN_KERNEL_BENCH!=1")
+
+    torch.manual_seed(0)
+    B, F, H, W, N, D = 1, 5, 22, 40, 24, 128
+    s = (F * H * W + 7) // 8  # SP=8 per-rank slice
+    sp_rank, sp_size = 0, 8
+    x = torch.randn(B, s, N, D, dtype=torch.bfloat16, device=device)
+    grid_sizes = torch.tensor([[F, H, W]] * B)
+    freqs = _make_freqs(max_seq_len=max(F, H, W) + 8, dim=D).to(device)
+    even_mask, odd_mask = _make_masks(D)
+    even_mask = even_mask.to(device)
+    odd_mask = odd_mask.to(device)
+
+    def ref_fn(x, gs, fr, em, om):
+        return _rope_apply_ref(x, gs, fr, em, om, sp_rank=sp_rank, sp_size=sp_size)
+
+    def nki_fn(x, gs, fr, em, om):
+        return rope_apply_nki(x, gs, fr, em, om, sp_rank=sp_rank, sp_size=sp_size)
+
+    res = run_compare(
+        label="rope_sp8_rank0_bf16",
+        ref_fn=ref_fn,
+        kernel_fn=nki_fn,
+        args=(x, grid_sizes, freqs, even_mask, odd_mask),
+        shape=(B, s, N, D),
+        dtype="bf16",
+    )
+    print(res.line())
+
+
 if __name__ == "__main__":
     test_kernel_math_contract_matches_masked_write()
     test_kernel_math_contract_sp_slice()

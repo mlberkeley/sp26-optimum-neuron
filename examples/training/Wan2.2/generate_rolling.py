@@ -37,6 +37,7 @@ import torch.distributed as dist
 from PIL import Image
 
 import wan
+import wan.kernels  # noqa: F401  (applies NKI patches when WAN_USE_NKI_KERNELS=1)
 from wan.configs import WAN_CONFIGS
 from wan.distributed.util import init_distributed_group
 from wan.utils.utils import save_video, str2bool

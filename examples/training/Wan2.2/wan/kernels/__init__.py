@@ -16,3 +16,13 @@ Usage:
 # `wan_attention_nki.py` would otherwise shadow each other.
 from . import attention_nki  # noqa: F401
 from . import wan_attention_nki  # noqa: F401
+
+# Activate runtime monkey-patches when WAN_USE_NKI_KERNELS=1. This is the
+# integration toggle for the inference path: with the flag set, importing
+# wan.kernels (which `import wan` does) replaces wan.modules.attention.attention,
+# WanRMSNorm.forward, and rope_apply with NKI-backed equivalents on Neuron.
+# Default OFF — must be explicitly opted into.
+import os as _os
+if _os.environ.get("WAN_USE_NKI_KERNELS", "").strip().lower() in ("1", "true", "yes", "on"):
+    from . import _enable_kernels as _enable_kernels  # noqa: F401
+    _enable_kernels.apply()

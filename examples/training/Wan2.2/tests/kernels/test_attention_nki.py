@@ -175,6 +175,126 @@ def test_wrapper_signature_parity():
     assert abs_err < 5e-2, f"attention_nki wrapper diverged: {abs_err}"
 
 
+# ---------- speedup benchmarks (RUN_KERNEL_BENCH=1) ----------
+
+
+def test_bench_self_attention_full():
+    """Bench NKI vs torch SDPA on the full TI2V-5B self-attn shape (no SP)."""
+    device = _device()
+    _maybe_skip(device)
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _bench import run_compare, should_run_bench  # noqa: E402
+
+    if not should_run_bench():
+        import pytest
+        pytest.skip("RUN_KERNEL_BENCH!=1")
+
+    from wan.kernels.attention_nki import nki_attention
+
+    torch.manual_seed(0)
+    B, L, H, D = 1, 4400, 24, 128
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device=device)
+
+    def torch_ref(q, k, v):
+        qt = q.transpose(1, 2)
+        kt = k.transpose(1, 2)
+        vt = v.transpose(1, 2)
+        out = torch.nn.functional.scaled_dot_product_attention(qt, kt, vt, is_causal=False)
+        return out.transpose(1, 2).contiguous()
+
+    res = run_compare(
+        label="self_attn_full_5B",
+        ref_fn=torch_ref,
+        kernel_fn=nki_attention,
+        args=(q, k, v),
+        shape=(B, L, H, D),
+        dtype="bf16",
+    )
+    print(res.line())
+
+
+def test_bench_self_attention_sp_post_a2a():
+    """SP=8 post-all-to-all shape: B=1 L=4400 H=3 D=128."""
+    device = _device()
+    _maybe_skip(device)
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _bench import run_compare, should_run_bench  # noqa: E402
+
+    if not should_run_bench():
+        import pytest
+        pytest.skip("RUN_KERNEL_BENCH!=1")
+
+    from wan.kernels.attention_nki import nki_attention
+
+    torch.manual_seed(0)
+    B, L, H, D = 1, 4400, 3, 128
+    q = torch.randn(B, L, H, D, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, L, H, D, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, L, H, D, dtype=torch.bfloat16, device=device)
+
+    def torch_ref(q, k, v):
+        qt = q.transpose(1, 2)
+        kt = k.transpose(1, 2)
+        vt = v.transpose(1, 2)
+        out = torch.nn.functional.scaled_dot_product_attention(qt, kt, vt, is_causal=False)
+        return out.transpose(1, 2).contiguous()
+
+    res = run_compare(
+        label="self_attn_sp_post_a2a",
+        ref_fn=torch_ref,
+        kernel_fn=nki_attention,
+        args=(q, k, v),
+        shape=(B, L, H, D),
+        dtype="bf16",
+    )
+    print(res.line())
+
+
+def test_bench_cross_attention():
+    """Cross-attn shape: q=[1,4400,24,128] k=v=[1,512,24,128]."""
+    device = _device()
+    _maybe_skip(device)
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _bench import run_compare, should_run_bench  # noqa: E402
+
+    if not should_run_bench():
+        import pytest
+        pytest.skip("RUN_KERNEL_BENCH!=1")
+
+    from wan.kernels.attention_nki import nki_attention
+
+    torch.manual_seed(0)
+    B, Lq, Lk, H, D = 1, 4400, 512, 24, 128
+    q = torch.randn(B, Lq, H, D, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, Lk, H, D, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, Lk, H, D, dtype=torch.bfloat16, device=device)
+
+    def torch_ref(q, k, v):
+        qt = q.transpose(1, 2)
+        kt = k.transpose(1, 2)
+        vt = v.transpose(1, 2)
+        out = torch.nn.functional.scaled_dot_product_attention(qt, kt, vt, is_causal=False)
+        return out.transpose(1, 2).contiguous()
+
+    res = run_compare(
+        label="cross_attn",
+        ref_fn=torch_ref,
+        kernel_fn=nki_attention,
+        args=(q, k, v),
+        shape=(B, Lq, H, D),
+        dtype="bf16",
+    )
+    print(res.line())
+
+
 if __name__ == "__main__":
     test_import_clean()
     test_cpu_fallback_matches_sdpa()
