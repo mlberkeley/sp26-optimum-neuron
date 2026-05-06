@@ -54,7 +54,15 @@ Beta-2 / NKI 0.3.0 APIs used
 - nisa.tensor_reduce(op=nl.add, axis=(1,)) : sum across H, fp32
 - nisa.tensor_scalar(op0=nl.multiply, ...) : scale by 1/H to compute mean,
                                               broadcast weight across partition axis
-- nisa.tensor_tensor(op=nl.subtract,...)   : x - mean (mean broadcast on F-axis)
+- nisa.tensor_scalar(op0=nl.subtract,
+                     operand0=mean)        : x - mean. Must use tensor_scalar
+                                              (not tensor_tensor) so the [P, 1]
+                                              mean broadcasts across the free
+                                              axis — tensor_tensor requires
+                                              lhs.free == rhs.free and is
+                                              rejected by the MLIR verifier
+                                              with "'dst' free total elements
+                                              H != 'rhs' free total elements 1".
 - nisa.activation(op=nl.square, ...)       : (x - mean)^2 via activation engine
 - nisa.activation(op=nl.rsqrt, scale=1/H, bias=eps_f)
                                             : fused (mean(diff^2) + eps) -> rsqrt
@@ -70,7 +78,11 @@ Beta-2 / NKI 0.3.0 APIs used
                                               total elements 1 != 'dst'
                                               partition total elements 128").
                                               See commit 4cd071fb (RMSNorm fix).
-- nisa.tensor_tensor(op=nl.multiply)       : (x - mu) * inv_std (broadcast inv_std)
+- nisa.tensor_scalar(op0=nl.multiply,
+                     operand0=inv_std)     : (x - mu) * inv_std with [P, 1]
+                                              inv_std broadcast across the
+                                              free axis (same constraint as
+                                              the subtract above).
 - nisa.tensor_scalar(op0=nl.multiply,
                      operand0=weight_sb,
                      op1=nl.add,
@@ -158,9 +170,19 @@ def _layernorm_no_affine_kernel(x_hbm, eps):
         )
 
         # ---- Pass 2: x - mean, then (x - mean)^2 reduction. --------------
-        # mean is [n_sz, 1]; tensor_tensor broadcasts it across the F-axis.
+        # mean is [n_sz, 1]. `nisa.tensor_tensor` requires lhs and rhs to
+        # share the same free dimension; passing rhs=[P, 1] vs dst=[P, H]
+        # is rejected by the MLIR verifier with "'dst' free total elements
+        # H != 'rhs' free total elements 1". `nisa.tensor_scalar` accepts
+        # a `(P, 1)` operand and broadcasts across the free axis natively.
+        # Computes `data - operand0` = `x_f32 - mean` (default reverse0=False).
         diff = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=diff, data1=x_f32, data2=mean, op=nl.subtract)
+        nisa.tensor_scalar(
+            dst=diff,
+            data=x_f32,
+            op0=nl.subtract,
+            operand0=mean,
+        )
 
         diff_sq = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(dst=diff_sq, data=diff, op=nl.square)
@@ -181,10 +203,14 @@ def _layernorm_no_affine_kernel(x_hbm, eps):
             bias=eps_f,
         )
 
-        # x_hat = diff * inv_std (inv_std broadcast across F-axis).
+        # x_hat = diff * inv_std (inv_std broadcast across F-axis). Same
+        # `tensor_tensor`-vs-`tensor_scalar` constraint as the subtract above.
         x_hat = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(
-            dst=x_hat, data1=diff, data2=inv_std, op=nl.multiply
+        nisa.tensor_scalar(
+            dst=x_hat,
+            data=diff,
+            op0=nl.multiply,
+            operand0=inv_std,
         )
 
         # Cast back to input dtype to match torch.nn.LayerNorm output dtype.
@@ -243,8 +269,15 @@ def _layernorm_affine_kernel(x_hbm, weight_hbm, bias_hbm, eps):
             dst=mean, data=sum_x, op0=nl.multiply, operand0=inv_h
         )
 
+        # `tensor_scalar` over `tensor_tensor` for the [P, H] - [P, 1]
+        # broadcast — see the no-affine kernel above for the rationale.
         diff = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=diff, data1=x_f32, data2=mean, op=nl.subtract)
+        nisa.tensor_scalar(
+            dst=diff,
+            data=x_f32,
+            op0=nl.subtract,
+            operand0=mean,
+        )
 
         diff_sq = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(dst=diff_sq, data=diff, op=nl.square)
@@ -262,8 +295,11 @@ def _layernorm_affine_kernel(x_hbm, weight_hbm, bias_hbm, eps):
         )
 
         x_hat = nl.ndarray((n_sz, H), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(
-            dst=x_hat, data1=diff, data2=inv_std, op=nl.multiply
+        nisa.tensor_scalar(
+            dst=x_hat,
+            data=diff,
+            op0=nl.multiply,
+            operand0=inv_std,
         )
 
         # y = x_hat * weight + bias, fused via tensor_scalar's pre-activation
