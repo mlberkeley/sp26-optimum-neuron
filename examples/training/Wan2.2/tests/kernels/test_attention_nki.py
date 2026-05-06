@@ -35,7 +35,12 @@ def _sdpa_reference(q_blhd: torch.Tensor, k_blhd: torch.Tensor, v_blhd: torch.Te
 
 def _device():
     if os.environ.get("NEURON_KERNEL_TEST") == "1":
-        return torch.device("xla")
+        try:
+            import torch_xla.core.xla_model as xm  # noqa: F401
+            return torch.device("xla")
+        except Exception:
+            # PyTorch Native Neuron path (no torch_xla in this venv).
+            return torch.device("neuron")
     return None  # signal to skip
 
 
