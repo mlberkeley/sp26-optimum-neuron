@@ -126,13 +126,15 @@ def _rope_kernel(x_hbm, cos_il_hbm, sin_il_hbm):
         y_hbm: [L, N*D] bf16 (matches reference impl's final cast back to
         x.dtype via `torch.stack(out).to(dtype=x.dtype)`).
     """
+    # NOTE: shape consistency checks (L matches across x/cos/sin, D matches
+    # across cos/sin, N_times_D % D == 0) are performed host-side in
+    # `nki_rope_apply`, NOT here. The NKI parser does not support `raise`
+    # statements inside @nki.jit bodies, and even Python `assert` only
+    # supports static (compile-time) conditions — runtime shape mismatches
+    # would otherwise cause the kernel to fail to specialize. See
+    # rope_nki.py history (Bug #2 fix) for context.
     L, N_times_D = x_hbm.shape
-    L2, D = cos_il_hbm.shape
-    L3, D2 = sin_il_hbm.shape
-
-    kernel_assert(L == L2 == L3, "rope: token axis mismatch x vs cos/sin")
-    kernel_assert(D == D2, "rope: head_dim mismatch cos vs sin")
-    kernel_assert(N_times_D % D == 0, "rope: N*D not divisible by D")
+    _, D = cos_il_hbm.shape
 
     N = N_times_D // D
     c2 = D  # full head dim; pair size = 2, so c = D//2
