@@ -48,6 +48,18 @@ Beta-2 / NKI 0.3.0 APIs used
 - nisa.activation(op=nl.rsqrt, scale=1/H, bias=eps)  : fused (mean+eps) -> rsqrt
                                               using the ScalarE pre-activation
                                               scale+bias to fold mean and eps.
+                                              `bias` is passed as a Python
+                                              float (compile-time constant) —
+                                              on NeuronCore-v3+ (trn2/trn3) the
+                                              activation engine accepts a scalar
+                                              bias directly; on v2 the NKI API
+                                              auto-broadcasts the scalar into a
+                                              [P, 1] vector before lowering.
+                                              An explicit [1, 1] SBUF eps buffer
+                                              is rejected by MLIR verification
+                                              ("'bias' partition total elements
+                                              1 != 'dst' partition total
+                                              elements 128").
 - nisa.tensor_tensor(op=nl.multiply)       : x * inv_rms (broadcast over F)
 - nisa.tensor_scalar(op0=nl.multiply, operand0=weight_sb)
                                             : multiply per-H weight broadcast
@@ -80,13 +92,16 @@ def div_ceil(n: int, d: int) -> int:
 
 # ----- the NKI kernel ---------------------------------------------------
 @nki.jit
-def _rmsnorm_kernel(x_hbm, weight_hbm, eps_hbm):
+def _rmsnorm_kernel(x_hbm, weight_hbm, eps):
     """RMSNorm forward kernel.
 
     Args:
         x_hbm:      [N, H]  bf16    where N = B*L, H % 128 == 0 (Wan H=3072)
         weight_hbm: [1, H]  fp32
-        eps_hbm:    [1, 1]  fp32    epsilon (broadcast as activation bias)
+        eps:        Python float — compile-time constant used as the
+                    `nisa.activation` bias. NKI passes Python scalars as
+                    scalar args (not tensors), and the activation engine
+                    on NeuronCore-v3+ accepts a scalar bias directly.
 
     Returns:
         y_hbm: [N, H] fp32 (intentional: matches WanRMSNorm.forward dtype)
@@ -103,12 +118,9 @@ def _rmsnorm_kernel(x_hbm, weight_hbm, eps_hbm):
     weight_sb = nl.ndarray((1, H), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=weight_sb, src=weight_hbm[0:1, 0:H])
 
-    # Load eps as a [1, 1] fp32 buffer to use as activation bias.
-    eps_sb = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=eps_sb, src=eps_hbm[0:1, 0:1])
-
     num_tiles = div_ceil(N, TILE_N)
     inv_h = 1.0 / float(H)
+    eps_f = float(eps)
 
     for tile_idx in nl.affine_range(num_tiles):
         n_start = tile_idx * TILE_N
@@ -132,13 +144,19 @@ def _rmsnorm_kernel(x_hbm, weight_hbm, eps_hbm):
 
         # inv_rms = rsqrt(sum_sq * (1/H) + eps)
         # Fused via activation engine's ScalarE pre-activation scale+bias.
+        # `bias` is a Python scalar (compile-time constant); on
+        # NeuronCore-v3+ the activation engine consumes scalars natively, and
+        # on v2 the NKI API auto-broadcasts a scalar bias to a [P, 1] vector.
+        # An [1, 1] SBUF buffer is NOT a valid bias here (MLIR verifier
+        # rejects it: "'bias' partition total elements 1 != 'dst' partition
+        # total elements 128").
         inv_rms = nl.ndarray((n_sz, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(
             dst=inv_rms,
             data=sum_sq,
             op=nl.rsqrt,
             scale=inv_h,
-            bias=eps_sb,
+            bias=eps_f,
         )
 
         # x_norm_fp32 = x_fp32 * inv_rms (inv_rms broadcast across F-axis)
@@ -231,9 +249,12 @@ def nki_rmsnorm(
     # Flatten B*L for the kernel; reshape back at the end.
     x_flat = x.reshape(B * L, H).contiguous()
     w_row = weight.to(torch.float32).reshape(1, H).contiguous()
-    eps_buf = torch.tensor(
-        [[float(eps)]], dtype=torch.float32, device=x.device
-    )
 
-    y_flat = _rmsnorm_kernel(x_flat, w_row, eps_buf)
+    # `eps` is passed as a Python scalar (compile-time constant). NKI
+    # forwards it to nisa.activation's `bias` arg, which the activation
+    # engine consumes directly on NeuronCore-v3+ and the NKI API
+    # auto-broadcasts to a [P, 1] vector on v2. Passing eps as a [1, 1]
+    # SBUF tensor instead fails MLIR verification because the bias
+    # partition dim must match the dst partition dim (128).
+    y_flat = _rmsnorm_kernel(x_flat, w_row, float(eps))
     return y_flat.reshape(B, L, H)
