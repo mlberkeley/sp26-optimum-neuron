@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+from PIL import Image
 
 
 cap = cv2.VideoCapture("walrus.mp4")
@@ -28,10 +29,13 @@ frames_9 = video_np[indices]  # (9, H, W)
 
 frames_t = torch.from_numpy(frames_9).float() / 255.0  # (9, H, W, 3)
 frames_t = frames_t.permute(0, 3, 1, 2)  # (9, 3, H, W)
+frames_t = torch.rot90(frames_t, k=1, dims=(2, 3))
 
 H, W = frames_t.shape[2], frames_t.shape[3]
 H_new = (H // 100) * 16
 W_new = (W // 100) * 16
+H_new, W_new = 256, 256
+
 frames_t = F.interpolate(frames_t, size=(H_new, W_new))  # (9, 3, H_new, W_new)
 
 frames_t = frames_t.permute(1, 0, 2, 3)  # (3, 9, H_new, W_new)
@@ -73,18 +77,32 @@ os.makedirs("reconstruction_output", exist_ok=True)
 orig = (x.detach() + 1) / 2        # (3, 9, H, W)
 recon = (x_hat.detach() + 1) / 2   # (3, 9, H, W)
 
-for i in range(9):
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-    
-    orig_frame = orig[:, i, :, :].permute(1, 2, 0).numpy()   # (H, W, 3)
-    recon_frame = recon[:, i, :, :].permute(1, 2, 0).numpy() # (H, W, 3)
-    
-    axes[0].imshow(orig_frame.clip(0, 1))
-    axes[0].set_title(f"Original frame {i}")
-    axes[1].imshow(recon_frame.clip(0, 1))
-    axes[1].set_title(f"Reconstruction frame {i}")
-    
-    plt.savefig(f"reconstruction_output/frame_{i}.png")
-    plt.close()
 
-print("saved frames to reconstruction_output/")
+
+os.makedirs("reconstruction_output", exist_ok=True)
+
+orig = x.detach().clamp(-1, 1).cpu()       # (3, 9, H, W)
+recon = x_hat.detach().clamp(-1, 1).cpu()  # (3, 9, H, W)
+
+def to_rgb_uint8(t: torch.Tensor) -> np.ndarray:
+    # t: (3, H, W) in [-1, 1]
+    return ((t + 1.0) * 0.5 * 255.0).byte().permute(1, 2, 0).numpy()
+
+diff_gain = 4.0
+
+for i in range(orig.shape[1]):
+    a = to_rgb_uint8(orig[:, i])   # original
+    b = to_rgb_uint8(recon[:, i])  # reconstruction
+
+    diff = np.abs(a.astype(np.int16) - b.astype(np.int16)).astype(np.float32)
+    d_vis = np.clip(diff * diff_gain, 0, 255).astype(np.uint8)
+
+    h, w, _ = a.shape
+    canvas = Image.new("RGB", (w * 3, h))
+    canvas.paste(Image.fromarray(a), (0, 0))
+    canvas.paste(Image.fromarray(b), (w, 0))
+    canvas.paste(Image.fromarray(d_vis), (2 * w, 0))
+
+    canvas.save(f"reconstruction_output/frame_{i}.png")
+
+print("saved triptych frames to reconstruction_output/")
