@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional
 import json
 import time
 import torch
+import torch_neuronx
 
 
 DEVICE = 'neuron'  # set to cuda, neuron or cpu
@@ -127,7 +128,7 @@ class Profiler:
         if DEVICE == 'cuda':
             torch.cuda.synchronize()
         elif DEVICE == 'neuron':
-            torch.neuron.synchronize()
+            torch_neuronx.xla_impl.ops.synchronize()
 
         node.start_time = time.perf_counter()
         self.stack.append(node)
@@ -139,7 +140,7 @@ class Profiler:
             if DEVICE == 'cuda':
                 torch.cuda.synchronize()
             elif DEVICE == 'neuron':
-                torch.neuron.synchronize()
+                torch_neuronx.xla_impl.ops.synchronize()
 
             node.end_time = time.perf_counter()
             node.elapsed_s = node.end_time - node.start_time
