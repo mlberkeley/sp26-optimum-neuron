@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from functools import partial
 
 import torch
+import torch_xla.core.xla_model as xm
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -72,8 +73,8 @@ class WanTI2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
-        # self.device = xm.xla_device()
-        self.device = device
+        self.device = xm.xla_device()
+        # self.device = device
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
@@ -299,7 +300,7 @@ class WanTI2V:
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=("cpu" if self.device == "cpu" or self.device == "neuron" else "cuda"))
+        seed_g = torch.Generator(device="cpu")
         seed_g.manual_seed(seed)
 
         if not self.t5_cpu:
@@ -485,7 +486,7 @@ class WanTI2V:
         seq_len = int(math.ceil(seq_len / self.sp_size)) * self.sp_size
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=("cpu" if self.device == "cpu" or self.device == "neuron" else "cuda"))
+        seed_g = torch.Generator(device="cpu")
         seed_g.manual_seed(seed)
         noise = torch.randn(
             self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
@@ -583,6 +584,7 @@ class WanTI2V:
                         latent_model_input, t=timestep, **arg_c)[0]
                     if offload_model:
                         pass
+                    xm.mark_step()
                     noise_pred_uncond = self.model(
                         latent_model_input, t=timestep, **arg_null)[0]
                     if offload_model:
@@ -601,11 +603,15 @@ class WanTI2V:
 
                     x0 = [latent]
                     del latent_model_input, timestep
+                    xm.mark_step()
 
+            xm.mark_step()
             if offload_model:
                 self.model.cpu()
 
 
+            self.vae.model.cpu()
+            x0 = [t.cpu() for t in x0]
             if self.rank == 0:
                 videos = self.vae.decode(x0)
 

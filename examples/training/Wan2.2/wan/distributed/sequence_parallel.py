@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
 import torch.cuda.amp as amp
+import torch_xla.core.xla_model as xm
 
 from ..modules.model import sinusoidal_embedding_1d
 from .ulysses import distributed_attention
@@ -20,8 +21,13 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
 
 
-@torch.amp.autocast('cuda', enabled=False)
+@torch.amp.autocast('cpu', enabled=False)
 def rope_apply(x, grid_sizes, freqs):
+    # Move to CPU for complex number operations unsupported on Neuron
+    device = x.device
+    x = x.cpu()
+    grid_sizes = grid_sizes.cpu()
+    freqs = [f.cpu() for f in freqs] if isinstance(freqs, (list, tuple)) else freqs.cpu()
     """
     x:          [B, L, N, C].
     grid_sizes: [B, 3].
@@ -37,7 +43,7 @@ def rope_apply(x, grid_sizes, freqs):
         seq_len = f * h * w
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
+        x_i = torch.view_as_complex(x[i, :s].to(torch.float32).reshape(
             s, n, -1, 2))
         freqs_i = torch.cat([
             freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
@@ -58,7 +64,7 @@ def rope_apply(x, grid_sizes, freqs):
 
         # append to collection
         output.append(x_i)
-    return torch.stack(output).float()
+    return torch.stack(output).float().to(device)
 
 
 def sp_dit_forward(
@@ -99,14 +105,14 @@ def sp_dit_forward(
     # time embeddings
     if t.dim() == 1:
         t = t.expand(t.size(0), seq_len)
-    with torch.amp.autocast('cuda', dtype=torch.float32):
+    with torch.amp.autocast('cpu', dtype=torch.float32):
         bt = t.size(0)
         t = t.flatten()
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim,
-                                    t).unflatten(0, (bt, seq_len)).float())
+                                    t).unflatten(0, (bt, seq_len)).to(next(self.time_embedding.parameters()).dtype))
         e0 = self.time_projection(e).unflatten(2, (6, self.dim))
-        assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        # assert removed: on XLA/Trainium dtype is bfloat16 not float32
 
     # context
     context_lens = None
@@ -159,6 +165,7 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
         return q, k, v
 
     q, k, v = qkv_fn(x)
+    xm.mark_step()
     q = rope_apply(q, grid_sizes, freqs)
     k = rope_apply(k, grid_sizes, freqs)
 

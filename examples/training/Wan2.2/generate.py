@@ -12,6 +12,7 @@ import random
 
 import torch
 import torch.distributed as dist
+import torch_xla.distributed.xla_backend
 from PIL import Image
 
 import wan
@@ -327,7 +328,7 @@ def generate(args):
         # torch.cuda.set_device(local_rank)
         pass
         dist.init_process_group(
-            backend="nccl",
+            backend="xla",
             init_method="env://",
             rank=rank,
             world_size=world_size)
@@ -367,8 +368,8 @@ def generate(args):
     logging.info(f"Generation model config: {cfg}")
 
     if dist.is_initialized():
-        base_seed = [args.base_seed] if rank == 0 else [None]
-        dist.broadcast_object_list(base_seed, src=0)
+        base_seed = [args.base_seed]
+        # XLA backend does not support broadcast_object_list, use fixed seed across ranks
         args.base_seed = base_seed[0]
 
     logging.info(f"Input prompt: {args.prompt}")

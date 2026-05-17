@@ -10,9 +10,10 @@ import json
 import time
 import torch
 import torch_neuronx
+import torch_xla.core.xla_model as xm
 
 
-DEVICE = 'neuron'  # set to cuda, neuron or cpu
+DEVICE = 'xla'  # set to cuda, neuron or cpu
 
 
 @dataclass
@@ -127,8 +128,8 @@ class Profiler:
         
         if DEVICE == 'cuda':
             torch.cuda.synchronize()
-        elif DEVICE == 'neuron':
-            torch_neuronx.xla_impl.ops.synchronize()
+        elif DEVICE == 'xla':
+            xm.wait_device_ops()
 
         node.start_time = time.perf_counter()
         self.stack.append(node)
@@ -139,8 +140,8 @@ class Profiler:
 
             if DEVICE == 'cuda':
                 torch.cuda.synchronize()
-            elif DEVICE == 'neuron':
-                torch_neuronx.xla_impl.ops.synchronize()
+            elif DEVICE == 'xla':
+                xm.wait_device_ops()
 
             node.end_time = time.perf_counter()
             node.elapsed_s = node.end_time - node.start_time

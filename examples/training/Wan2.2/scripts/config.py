@@ -8,7 +8,7 @@ IMAGE_PATH = WAN_ROOT / "examples" / "i2v_input.JPG"
 OUTPUT_DIR = WAN_ROOT / "outputs"
 
 # ---------- device/runtime ----------
-DEVICE = "neuron"  # SET DEVICE!!!!
+DEVICE = "xla"  # SET DEVICE!!!!
 DEVICE_ID = 0
 RANK = 0
 
@@ -38,8 +38,8 @@ SIZE = "1280*704"
 # SAMPLE_STEPS = 24
 
 # smaller numbers
-FRAME_NUM = 17
-SAMPLE_STEPS = 8
+FRAME_NUM = 5
+SAMPLE_STEPS = 2
 
 SAMPLE_SOLVER = "unipc"
 BASE_SEED = 1234
