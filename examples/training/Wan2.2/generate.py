@@ -18,6 +18,11 @@ from PIL import Image
 import wan
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.distributed.util import init_distributed_group
+try:
+    from neuronx_distributed.parallel_layers import parallel_state
+    NXD_AVAILABLE = True
+except ImportError:
+    NXD_AVAILABLE = False
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import merge_video_audio, save_video, str2bool
 
@@ -343,6 +348,8 @@ def generate(args):
     if args.ulysses_size > 1:
         assert args.ulysses_size == world_size, f"The number of ulysses_size should be equal to the world size."
         init_distributed_group()
+        if NXD_AVAILABLE:
+            parallel_state.initialize_model_parallel(tensor_model_parallel_size=world_size)
 
     if args.use_prompt_extend:
         if args.prompt_extend_method == "dashscope":

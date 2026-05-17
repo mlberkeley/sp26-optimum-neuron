@@ -104,7 +104,7 @@ class WanTI2V:
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         with region("load_from_pretrained"):
-            self.model = WanModel.from_pretrained(checkpoint_dir)
+            self.model = WanModel.from_pretrained(checkpoint_dir, ignore_mismatched_sizes=True, low_cpu_mem_usage=False)
 
         self.model = self._configure_model(
             model=self.model,

@@ -8,6 +8,12 @@ from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import attention as flash_attention
 from profiling import trace, region
+try:
+    from neuronx_distributed.parallel_layers import ColumnParallelLinear, RowParallelLinear
+    from neuronx_distributed.parallel_layers import parallel_state
+    NXD_AVAILABLE = True
+except ImportError:
+    NXD_AVAILABLE = False
 
 __all__ = ['WanModel']
 
@@ -251,12 +257,26 @@ class WanSelfAttention(nn.Module):
         self.eps = eps
 
         # layers
-        self.q = nn.Linear(dim, dim)
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, dim)
-        self.o = nn.Linear(dim, dim)
-        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        print(f"DEBUG: NXD_AVAILABLE={NXD_AVAILABLE}, model_parallel_is_initialized={parallel_state.model_parallel_is_initialized() if NXD_AVAILABLE else False}")
+        if NXD_AVAILABLE and parallel_state.model_parallel_is_initialized():
+            self.q = ColumnParallelLinear(dim, dim, gather_output=False, dtype=torch.bfloat16)
+            self.k = ColumnParallelLinear(dim, dim, gather_output=False, dtype=torch.bfloat16)
+            self.v = ColumnParallelLinear(dim, dim, gather_output=False, dtype=torch.bfloat16)
+            self.o = RowParallelLinear(dim, dim, input_is_parallel=True, dtype=torch.bfloat16)
+        else:
+            self.q = nn.Linear(dim, dim)
+            self.k = nn.Linear(dim, dim)
+            self.v = nn.Linear(dim, dim)
+            self.o = nn.Linear(dim, dim)
+        if NXD_AVAILABLE and parallel_state.model_parallel_is_initialized():
+            tp_size = parallel_state.get_tensor_model_parallel_size()
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            norm_dim = dim // tp_size
+            self.norm_q = WanRMSNorm(norm_dim, eps=eps) if qk_norm else nn.Identity()
+            self.norm_k = WanRMSNorm(norm_dim, eps=eps) if qk_norm else nn.Identity()
+        else:
+            self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+            self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
         even_mask = torch.zeros(1, 1, self.head_dim, dtype=torch.float32)
         even_mask[..., 0::2] = 1

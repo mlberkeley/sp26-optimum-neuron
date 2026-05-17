@@ -2,6 +2,18 @@
 import torch
 import torch.cuda.amp as amp
 import torch_xla.core.xla_model as xm
+try:
+    from neuronx_distributed.parallel_layers import parallel_state as nxd_parallel_state
+    NXD_AVAILABLE = True
+except ImportError:
+    NXD_AVAILABLE = False
+    nxd_parallel_state = None
+try:
+    from neuronx_distributed.parallel_layers import parallel_state as nxd_parallel_state
+    NXD_AVAILABLE = True
+except ImportError:
+    NXD_AVAILABLE = False
+    nxd_parallel_state = None
 
 from ..modules.model import sinusoidal_embedding_1d
 from .ulysses import distributed_attention
@@ -159,9 +171,11 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
 
     # query, key, value function
     def qkv_fn(x):
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
-        k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
+        tp_size = nxd_parallel_state.get_tensor_model_parallel_size() if (NXD_AVAILABLE and nxd_parallel_state.model_parallel_is_initialized()) else 1
+        n_local = n // tp_size
+        q = self.norm_q(self.q(x)).view(b, s, n_local, d)
+        k = self.norm_k(self.k(x)).view(b, s, n_local, d)
+        v = self.v(x).view(b, s, n_local, d)
         return q, k, v
 
     q, k, v = qkv_fn(x)
