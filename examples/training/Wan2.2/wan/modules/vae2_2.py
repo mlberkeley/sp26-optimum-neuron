@@ -7,6 +7,15 @@ import torch.nn.functional as F
 from einops import rearrange
 from profiling import trace, region
 
+from .causal_conv3d_nki import (
+    HEAD_IN_CHANNELS,
+    HEAD_OUT_CHANNEL_PAD,
+    HEAD_OUT_CHANNELS,
+    causal_conv3d_head_256x12_cached,
+    causal_conv3d_ks3s1_cached,
+    nki_available,
+)
+
 __all__ = [
     "Wan2_2_VAE",
 ]
@@ -19,8 +28,13 @@ class CausalConv3d(nn.Conv3d):
     Causal 3d convolusion.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, use_nki_decoder_kernel=False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.use_nki_decoder_kernel = use_nki_decoder_kernel
+        self._nki_weight_cache = None
+        self._nki_weight_cache_key = None
+        self._nki_bias_cache = None
+        self._nki_bias_cache_key = None
         self._padding = (
             self.padding[2],
             self.padding[2],
@@ -31,16 +45,111 @@ class CausalConv3d(nn.Conv3d):
         )
         self.padding = (0, 0, 0)
 
+    def _can_use_nki_decoder_kernel(self, x, cache_x):
+        device_type = getattr(x.device, "type", "")
+        return (
+            self.use_nki_decoder_kernel
+            and causal_conv3d_ks3s1_cached is not None
+            and nki_available()
+            and device_type in {"neuron", "xla"}
+            and cache_x is not None
+            and cache_x.shape[2] == CACHE_T
+            and x.dim() == 5
+            and self.kernel_size == (3, 3, 3)
+            and self.stride == (1, 1, 1)
+            and self.dilation == (1, 1, 1)
+            and self.groups == 1
+            and self.bias is not None
+            and self._padding == (1, 1, 1, 1, 2, 0)
+        )
+
+    def _is_nki_head_kernel_shape(self):
+        return (
+            self.in_channels == HEAD_IN_CHANNELS
+            and self.out_channels == HEAD_OUT_CHANNELS
+        )
+
+    def _get_nki_weight(self, out_channel_pad=None):
+        cache_key = (
+            str(self.weight.device),
+            self.weight.dtype,
+            self.weight._version,
+            out_channel_pad,
+        )
+        if self._nki_weight_cache is None or self._nki_weight_cache_key != cache_key:
+            weight = self.weight
+            if out_channel_pad is not None and out_channel_pad > self.out_channels:
+                pad_shape = (out_channel_pad - self.out_channels, *weight.shape[1:])
+                weight = torch.cat(
+                    [
+                        weight,
+                        weight.new_zeros(pad_shape),
+                    ],
+                    dim=0,
+                )
+            self._nki_weight_cache = weight.permute(2, 3, 4, 1, 0).contiguous()
+            self._nki_weight_cache_key = cache_key
+        return self._nki_weight_cache
+
+    def _get_nki_bias(self, out_channel_pad=None):
+        cache_key = (
+            str(self.bias.device),
+            self.bias.dtype,
+            self.bias._version,
+            out_channel_pad,
+        )
+        if self._nki_bias_cache is None or self._nki_bias_cache_key != cache_key:
+            bias = self.bias
+            if out_channel_pad is not None and out_channel_pad > self.out_channels:
+                bias = torch.cat(
+                    [
+                        bias,
+                        bias.new_zeros((out_channel_pad - self.out_channels,)),
+                    ],
+                    dim=0,
+                )
+            self._nki_bias_cache = bias.contiguous()
+            self._nki_bias_cache_key = cache_key
+        return self._nki_bias_cache
+
     @trace("causal_conv_3d")
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
-        if cache_x is not None and self._padding[4] > 0:
-            cache_x = cache_x.to(device=x.device, dtype=x.dtype)
-            x = torch.cat([cache_x, x], dim=2)
-            padding[4] -= cache_x.shape[2]
-        x = F.pad(x, padding)
+        if self._can_use_nki_decoder_kernel(x, cache_x):
+            with region("causal_conv_3d_nki"):
+                cache_x = cache_x.to(device=x.device, dtype=x.dtype)
+                spatial_padding = (
+                    padding[0],
+                    padding[1],
+                    padding[2],
+                    padding[3],
+                    0,
+                    0,
+                )
+                x_spatial = F.pad(x, spatial_padding)
+                cache_spatial = F.pad(cache_x, spatial_padding)
+                if self._is_nki_head_kernel_shape():
+                    return causal_conv3d_head_256x12_cached(
+                        x_spatial,
+                        cache_spatial,
+                        self._get_nki_weight(HEAD_OUT_CHANNEL_PAD),
+                        self._get_nki_bias(HEAD_OUT_CHANNEL_PAD),
+                    )
+                return causal_conv3d_ks3s1_cached(
+                    x_spatial,
+                    cache_spatial,
+                    self._get_nki_weight(),
+                    self._get_nki_bias(),
+                )
 
-        return super().forward(x)
+        with region("causal_conv_3d_torch"):
+            if cache_x is not None and self._padding[4] > 0:
+                cache_x = cache_x.to(device=x.device, dtype=x.dtype)
+                x = torch.cat([cache_x, x], dim=2)
+                padding[4] -= cache_x.shape[2]
+            x = F.pad(x, padding)
+
+            return super().forward(x)
 
 
 class RMS_norm(nn.Module):
@@ -193,7 +302,13 @@ class Resample(nn.Module):
 
 class ResidualBlock(nn.Module):
 
-    def __init__(self, in_dim, out_dim, dropout=0.0):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        dropout=0.0,
+        use_nki_causal_conv3d=False,
+    ):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
@@ -202,11 +317,23 @@ class ResidualBlock(nn.Module):
         self.residual = nn.Sequential(
             RMS_norm(in_dim, images=False),
             nn.SiLU(),
-            CausalConv3d(in_dim, out_dim, 3, padding=1),
+            CausalConv3d(
+                in_dim,
+                out_dim,
+                3,
+                padding=1,
+                use_nki_decoder_kernel=use_nki_causal_conv3d,
+            ),
             RMS_norm(out_dim, images=False),
             nn.SiLU(),
             nn.Dropout(dropout),
-            CausalConv3d(out_dim, out_dim, 3, padding=1),
+            CausalConv3d(
+                out_dim,
+                out_dim,
+                3,
+                padding=1,
+                use_nki_decoder_kernel=use_nki_causal_conv3d,
+            ),
         )
         self.shortcut = (
             CausalConv3d(in_dim, out_dim, 1)
@@ -461,7 +588,8 @@ class Up_ResidualBlock(nn.Module):
                  dropout,
                  mult,
                  temperal_upsample=False,
-                 up_flag=False):
+                 up_flag=False,
+                 use_nki_causal_conv3d=False):
         super().__init__()
         # Shortcut path with upsample
         if up_flag:
@@ -477,7 +605,13 @@ class Up_ResidualBlock(nn.Module):
         # Main path with residual blocks and upsample
         upsamples = []
         for _ in range(mult):
-            upsamples.append(ResidualBlock(in_dim, out_dim, dropout))
+            upsamples.append(
+                ResidualBlock(
+                    in_dim,
+                    out_dim,
+                    dropout,
+                    use_nki_causal_conv3d=use_nki_causal_conv3d,
+                ))
             in_dim = out_dim
 
         # Add the final upsample block
@@ -625,6 +759,7 @@ class Decoder3d(nn.Module):
         attn_scales=[],
         temperal_upsample=[False, True, True],
         dropout=0.0,
+        use_nki_causal_conv3d=False,
     ):
         super().__init__()
         self.dim = dim
@@ -638,13 +773,29 @@ class Decoder3d(nn.Module):
         dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
         scale = 1.0 / 2**(len(dim_mult) - 2)
         # init block
-        self.conv1 = CausalConv3d(z_dim, dims[0], 3, padding=1)
+        self.conv1 = CausalConv3d(
+            z_dim,
+            dims[0],
+            3,
+            padding=1,
+            use_nki_decoder_kernel=use_nki_causal_conv3d,
+        )
 
         # middle blocks
         self.middle = nn.Sequential(
-            ResidualBlock(dims[0], dims[0], dropout),
+            ResidualBlock(
+                dims[0],
+                dims[0],
+                dropout,
+                use_nki_causal_conv3d=use_nki_causal_conv3d,
+            ),
             AttentionBlock(dims[0]),
-            ResidualBlock(dims[0], dims[0], dropout),
+            ResidualBlock(
+                dims[0],
+                dims[0],
+                dropout,
+                use_nki_causal_conv3d=use_nki_causal_conv3d,
+            ),
         )
 
         # upsample blocks
@@ -660,6 +811,7 @@ class Decoder3d(nn.Module):
                     mult=num_res_blocks + 1,
                     temperal_upsample=t_up_flag,
                     up_flag=i != len(dim_mult) - 1,
+                    use_nki_causal_conv3d=use_nki_causal_conv3d,
                 ))
         self.upsamples = nn.Sequential(*upsamples)
 
@@ -667,7 +819,13 @@ class Decoder3d(nn.Module):
         self.head = nn.Sequential(
             RMS_norm(out_dim, images=False),
             nn.SiLU(),
-            CausalConv3d(out_dim, 12, 3, padding=1),
+            CausalConv3d(
+                out_dim,
+                12,
+                3,
+                padding=1,
+                use_nki_decoder_kernel=use_nki_causal_conv3d,
+            ),
         )
 
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
@@ -744,6 +902,7 @@ class WanVAE_(nn.Module):
         attn_scales=[],
         temperal_downsample=[True, True, False],
         dropout=0.0,
+        use_nki_causal_conv3d=False,
     ):
         super().__init__()
         self.dim = dim
@@ -774,6 +933,7 @@ class WanVAE_(nn.Module):
             attn_scales,
             self.temperal_upsample,
             dropout,
+            use_nki_causal_conv3d=use_nki_causal_conv3d,
         )
 
     def forward(self, x, scale=[0, 1]):
@@ -861,7 +1021,14 @@ class WanVAE_(nn.Module):
         self._enc_feat_map = [None] * self._enc_conv_num
 
 
-def _video_vae(pretrained_path=None, z_dim=16, dim=160, device="cpu", **kwargs):
+def _video_vae(
+    pretrained_path=None,
+    z_dim=16,
+    dim=160,
+    device="cpu",
+    use_nki_causal_conv3d=False,
+    **kwargs,
+):
     # params
     cfg = dict(
         dim=dim,
@@ -871,6 +1038,7 @@ def _video_vae(pretrained_path=None, z_dim=16, dim=160, device="cpu", **kwargs):
         attn_scales=[],
         temperal_downsample=[True, True, True],
         dropout=0.0,
+        use_nki_causal_conv3d=use_nki_causal_conv3d,
     )
     cfg.update(**kwargs)
 
@@ -898,6 +1066,7 @@ class Wan2_2_VAE:
         temperal_downsample=[False, True, True],
         dtype=torch.float,
         device="cpu",
+        use_nki_causal_conv3d=False,
     ):
 
         self.dtype = dtype
@@ -1021,6 +1190,7 @@ class Wan2_2_VAE:
                 dim=c_dim,
                 dim_mult=dim_mult,
                 temperal_downsample=temperal_downsample,
+                use_nki_causal_conv3d=use_nki_causal_conv3d,
             ).eval().requires_grad_(False).to(device).to(self.dtype))
 
     @trace("vae2_2_encode")

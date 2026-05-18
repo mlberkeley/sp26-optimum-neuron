@@ -67,6 +67,7 @@ def _build_pipeline():
         t5_cpu=config.T5_CPU,
         convert_model_dtype=config.CONVERT_MODEL_DTYPE,
         device=config.DEVICE,
+        use_nki_causal_conv3d=config.ENABLE_NKI_CAUSAL_CONV3D,
     )
 
 

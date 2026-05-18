@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 # ---------- paths ----------
@@ -18,6 +19,10 @@ CONVERT_MODEL_DTYPE = True
 T5_FSDP = False
 DIT_FSDP = False
 USE_SP = False
+ENABLE_NKI_CAUSAL_CONV3D = (
+    os.environ.get("WAN_ENABLE_NKI_CAUSAL_CONV3D", "0").lower()
+    in {"1", "true", "yes"}
+)
 
 # ---------- run mode ----------
 SKIP_SAVE = False

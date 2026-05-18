@@ -44,7 +44,8 @@ class WanTI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
-        device="cpu"
+        device="cpu",
+        use_nki_causal_conv3d=False,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -99,7 +100,9 @@ class WanTI2V:
         self.vae = Wan2_2_VAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             dtype=self.param_dtype,
-            device=self.device)
+            device=self.device,
+            use_nki_causal_conv3d=use_nki_causal_conv3d,
+        )
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         with region("load_from_pretrained"):
